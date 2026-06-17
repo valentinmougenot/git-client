@@ -63,9 +63,33 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_status(repo, events);
         }
+        GitCommand::StageAll => {
+            if let Err(error) = stage_all(repo) {
+                events.emit(GitEvent::Error(GitError::new("stage all", &error)));
+            }
+            emit_status(repo, events);
+        }
         GitCommand::UnstageFile(path) => {
             if let Err(error) = unstage(repo, &path) {
                 events.emit(GitEvent::Error(GitError::new("unstage file", &error)));
+            }
+            emit_status(repo, events);
+        }
+        GitCommand::UnstageAll => {
+            if let Err(error) = unstage_all(repo) {
+                events.emit(GitEvent::Error(GitError::new("unstage all", &error)));
+            }
+            emit_status(repo, events);
+        }
+        GitCommand::Discard(path) => {
+            if let Err(error) = discard(repo, &path) {
+                events.emit(GitEvent::Error(error));
+            }
+            emit_status(repo, events);
+        }
+        GitCommand::DiscardAll => {
+            if let Err(error) = discard_all(repo) {
+                events.emit(GitEvent::Error(error));
             }
             emit_status(repo, events);
         }
@@ -198,6 +222,78 @@ fn unstage(repo: &Repository, path: &str) -> Result<(), git2::Error> {
             index.write()
         }
     }
+}
+
+/// Stage every Unstaged and Untracked File at once.
+///
+/// `add_all` picks up new and modified files (respecting `.gitignore`);
+/// `update_all` records deletions of tracked files removed from the workdir.
+fn stage_all(repo: &Repository) -> Result<(), git2::Error> {
+    let mut index = repo.index()?;
+    index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
+    index.update_all(["*"], None)?;
+    index.write()
+}
+
+/// Empty the Staging Area without touching the Working Tree (a mixed reset).
+fn unstage_all(repo: &Repository) -> Result<(), git2::Error> {
+    match repo.head() {
+        Ok(head) => {
+            let target = head.peel(ObjectType::Commit)?;
+            repo.reset(&target, git2::ResetType::Mixed, None)
+        }
+        Err(_) => {
+            // No HEAD yet: clearing the index unstages everything.
+            let mut index = repo.index()?;
+            index.clear()?;
+            index.write()
+        }
+    }
+}
+
+/// Discard Working Tree changes for one file.
+///
+/// An Untracked File has nothing to revert to, so it is deleted from disk; a
+/// tracked file is restored from the index (the equivalent of `git checkout`).
+fn discard(repo: &Repository, path: &str) -> Result<(), GitError> {
+    let status = repo
+        .status_file(Path::new(path))
+        .map_err(|error| GitError::new("discard", &error))?;
+
+    if status.contains(Status::WT_NEW) {
+        delete_from_workdir(repo, path)
+    } else {
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.path(path).force();
+        repo.checkout_index(None, Some(&mut checkout))
+            .map_err(|error| GitError::new("discard", &error))
+    }
+}
+
+/// Discard all Working Tree changes: restore tracked files from the index and
+/// delete every Untracked File.
+fn discard_all(repo: &Repository) -> Result<(), GitError> {
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    repo.checkout_index(None, Some(&mut checkout))
+        .map_err(|error| GitError::new("discard all", &error))?;
+
+    let (unstaged, _) = status(repo).map_err(|error| GitError::new("discard all", &error))?;
+    for entry in unstaged {
+        if entry.change == ChangeKind::Untracked {
+            delete_from_workdir(repo, &entry.path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a file from the Working Tree on disk.
+fn delete_from_workdir(repo: &Repository, path: &str) -> Result<(), GitError> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::custom("discard", "the repository has no working tree"))?;
+    std::fs::remove_file(workdir.join(path))
+        .map_err(|error| GitError::custom("discard", error.to_string()))
 }
 
 /// Create a Commit from the current Staging Area, returning its short SHA.
@@ -568,6 +664,87 @@ mod tests {
             "expected an added 'line2' line, got {:?}",
             diff.lines
         );
+    }
+
+    #[test]
+    fn stage_all_stages_every_file() {
+        let (dir, repo) = temp_repo();
+        write(dir.path(), "a.txt", "a\n");
+        write(dir.path(), "b.txt", "b\n");
+        let events = Collector::default();
+
+        process(&repo, GitCommand::StageAll, &events);
+
+        let (unstaged, staged) = events.last_status();
+        assert!(unstaged.is_empty());
+        assert_eq!(paths(&staged), ["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn unstage_all_empties_the_staging_area() {
+        let (dir, repo) = temp_repo();
+        write(dir.path(), "a.txt", "a\n");
+        write(dir.path(), "b.txt", "b\n");
+        let events = Collector::default();
+        process(&repo, GitCommand::StageAll, &events);
+
+        process(&repo, GitCommand::UnstageAll, &events);
+
+        let (unstaged, staged) = events.last_status();
+        assert!(staged.is_empty());
+        assert_eq!(paths(&unstaged), ["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn discard_deletes_an_untracked_file() {
+        let (dir, repo) = temp_repo();
+        write(dir.path(), "junk.txt", "junk\n");
+        let events = Collector::default();
+
+        process(&repo, GitCommand::Discard("junk.txt".into()), &events);
+
+        assert!(!dir.path().join("junk.txt").exists());
+        let (unstaged, _) = events.last_status();
+        assert!(unstaged.is_empty());
+    }
+
+    #[test]
+    fn discard_reverts_a_modified_tracked_file() {
+        let (dir, repo) = temp_repo();
+        write(dir.path(), "a.txt", "original\n");
+        let events = Collector::default();
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Commit("base".into()), &events);
+
+        write(dir.path(), "a.txt", "tampered\n");
+        process(&repo, GitCommand::Discard("a.txt".into()), &events);
+
+        let restored = fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(restored, "original\n");
+        let (unstaged, _) = events.last_status();
+        assert!(unstaged.is_empty());
+    }
+
+    #[test]
+    fn discard_all_reverts_tracked_and_deletes_untracked() {
+        let (dir, repo) = temp_repo();
+        write(dir.path(), "tracked.txt", "original\n");
+        let events = Collector::default();
+        process(&repo, GitCommand::StageFile("tracked.txt".into()), &events);
+        process(&repo, GitCommand::Commit("base".into()), &events);
+
+        write(dir.path(), "tracked.txt", "tampered\n");
+        write(dir.path(), "untracked.txt", "new\n");
+        process(&repo, GitCommand::DiscardAll, &events);
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!dir.path().join("untracked.txt").exists());
+        let (unstaged, staged) = events.last_status();
+        assert!(unstaged.is_empty());
+        assert!(staged.is_empty());
     }
 
     #[test]

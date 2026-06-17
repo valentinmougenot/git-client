@@ -4,6 +4,7 @@
 //! `git` to `ui` via messages, and the [`Subscription`] turns the Git Worker's
 //! [`GitEvent`] stream and the keyboard into messages.
 
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,11 @@ pub struct App {
     pub notification: Notification,
     /// Label of an in-progress remote operation (Push/Pull), if any.
     pub operation: Option<String>,
+    /// The files checked for a bulk action (the action targets). Distinct from
+    /// `repo.selected`, which is the one file whose Diff is shown.
+    pub checked: HashSet<Selection>,
+    /// Whether Discard is armed, awaiting a confirming second press.
+    pub discard_armed: bool,
 }
 
 /// Working Tree and Staging Area contents, the selected file, and its Diff.
@@ -49,8 +55,9 @@ pub struct RepoState {
     pub diff: Option<Diff>,
 }
 
-/// Which file is selected and from which side of the File List.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A file in the File List, identified by its path and which side it is on.
+/// Used both for the active (diff) selection and for checked action targets.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Selection {
     pub path: String,
     pub staged: bool,
@@ -95,7 +102,20 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum UiMessage {
-    FileSelected { path: String, staged: bool },
+    /// Make a file active (show its Diff).
+    FileSelected {
+        path: String,
+        staged: bool,
+    },
+    /// Toggle one file's checkbox (action target).
+    ToggleChecked {
+        path: String,
+        staged: bool,
+    },
+    /// Check or uncheck every file in a section (Unstaged or Staged).
+    ToggleSection {
+        staged: bool,
+    },
     CommitMessageChanged(String),
     DismissStatus,
     SelectNext,
@@ -104,10 +124,17 @@ pub enum UiMessage {
 
 #[derive(Debug, Clone)]
 pub enum GitMessage {
-    Stage(String),
-    Unstage(String),
+    /// Stage the active file (keyboard shortcut).
     StageSelected,
+    /// Unstage the active file (keyboard shortcut).
     UnstageSelected,
+    /// Stage the checked Unstaged files (or all of them if none are checked).
+    StageChecked,
+    /// Unstage the checked Staged files (or all of them if none are checked).
+    UnstageChecked,
+    /// Discard the checked Unstaged files (or all). First press arms the
+    /// confirmation; the second press performs it.
+    DiscardChecked,
     Commit,
     Push,
     Pull,
@@ -122,6 +149,8 @@ impl App {
             status: StatusBar::default(),
             notification: Notification::default(),
             operation: None,
+            checked: HashSet::new(),
+            discard_armed: false,
         }
     }
 
@@ -133,8 +162,18 @@ impl App {
     }
 
     fn update_ui(&mut self, message: UiMessage) {
+        // Interacting elsewhere cancels a pending Discard confirmation.
+        self.discard_armed = false;
+
         match message {
             UiMessage::FileSelected { path, staged } => self.select(path, staged),
+            UiMessage::ToggleChecked { path, staged } => {
+                let item = Selection { path, staged };
+                if !self.checked.remove(&item) {
+                    self.checked.insert(item);
+                }
+            }
+            UiMessage::ToggleSection { staged } => self.toggle_section(staged),
             UiMessage::CommitMessageChanged(value) => self.commit.message = value,
             UiMessage::DismissStatus => self.status.message = None,
             UiMessage::SelectNext => self.move_selection(1),
@@ -143,9 +182,13 @@ impl App {
     }
 
     fn update_git(&mut self, message: GitMessage) {
+        // Any git action other than re-pressing Discard cancels its pending
+        // confirmation.
+        if !matches!(message, GitMessage::DiscardChecked) {
+            self.discard_armed = false;
+        }
+
         match message {
-            GitMessage::Stage(path) => self.dispatch(GitCommand::StageFile(path)),
-            GitMessage::Unstage(path) => self.dispatch(GitCommand::UnstageFile(path)),
             GitMessage::StageSelected => {
                 if let Some(selection) = &self.repo.selected
                     && !selection.staged
@@ -160,9 +203,86 @@ impl App {
                     self.dispatch(GitCommand::UnstageFile(selection.path.clone()));
                 }
             }
+            GitMessage::StageChecked => {
+                let paths = self.checked_paths(false);
+                if paths.is_empty() {
+                    self.dispatch(GitCommand::StageAll);
+                } else {
+                    for path in paths {
+                        self.dispatch(GitCommand::StageFile(path));
+                    }
+                }
+            }
+            GitMessage::UnstageChecked => {
+                let paths = self.checked_paths(true);
+                if paths.is_empty() {
+                    self.dispatch(GitCommand::UnstageAll);
+                } else {
+                    for path in paths {
+                        self.dispatch(GitCommand::UnstageFile(path));
+                    }
+                }
+            }
+            GitMessage::DiscardChecked => {
+                // First press arms; the confirming second press discards.
+                if !self.discard_armed {
+                    self.discard_armed = true;
+                    return;
+                }
+                self.discard_armed = false;
+                let paths = self.checked_paths(false);
+                if paths.is_empty() {
+                    self.dispatch(GitCommand::DiscardAll);
+                } else {
+                    for path in paths {
+                        self.dispatch(GitCommand::Discard(path));
+                    }
+                }
+            }
             GitMessage::Commit => self.start_commit(),
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
+        }
+    }
+
+    /// Paths of the checked files on one side of the File List.
+    fn checked_paths(&self, staged: bool) -> Vec<String> {
+        self.checked
+            .iter()
+            .filter(|item| item.staged == staged)
+            .map(|item| item.path.clone())
+            .collect()
+    }
+
+    /// Check every file in a section, or uncheck them all if they already are.
+    fn toggle_section(&mut self, staged: bool) {
+        let list = if staged {
+            &self.repo.staged
+        } else {
+            &self.repo.unstaged
+        };
+        let all_checked = !list.is_empty()
+            && list.iter().all(|entry| {
+                self.checked.contains(&Selection {
+                    path: entry.path.clone(),
+                    staged,
+                })
+            });
+
+        let items: Vec<Selection> = list
+            .iter()
+            .map(|entry| Selection {
+                path: entry.path.clone(),
+                staged,
+            })
+            .collect();
+
+        for item in items {
+            if all_checked {
+                self.checked.remove(&item);
+            } else {
+                self.checked.insert(item);
+            }
         }
     }
 
@@ -172,6 +292,7 @@ impl App {
                 self.repo.unstaged = unstaged;
                 self.repo.staged = staged;
                 self.reconcile_selection();
+                self.prune_checked();
             }
             GitEvent::DiffLoaded(diff) => {
                 // Discard a Diff that no longer matches the current selection
@@ -285,6 +406,20 @@ impl App {
             self.repo.selected = None;
             self.repo.diff = None;
         }
+    }
+
+    /// Drop checked entries whose file no longer exists on its side (it was
+    /// staged, committed, or discarded), so the checkbox state stays truthful.
+    fn prune_checked(&mut self) {
+        let repo = &self.repo;
+        self.checked.retain(|item| {
+            let list = if item.staged {
+                &repo.staged
+            } else {
+                &repo.unstaged
+            };
+            list.iter().any(|entry| entry.path == item.path)
+        });
     }
 
     fn notify(&mut self, message: String) {
@@ -546,6 +681,90 @@ mod tests {
             Message::Ui(UiMessage::CommitMessageChanged("wip".to_string())),
         );
         assert_eq!(app.commit.message, "wip");
+    }
+
+    #[test]
+    fn discard_requires_a_confirming_second_press() {
+        let mut app = App::new();
+
+        // First press only arms the confirmation.
+        update(&mut app, Message::Git(GitMessage::DiscardChecked));
+        assert!(app.discard_armed);
+
+        // Second press fires and disarms.
+        update(&mut app, Message::Git(GitMessage::DiscardChecked));
+        assert!(!app.discard_armed);
+    }
+
+    #[test]
+    fn other_actions_cancel_a_pending_discard() {
+        let mut app = App::new();
+        update(&mut app, Message::Git(GitMessage::DiscardChecked));
+        assert!(app.discard_armed);
+
+        // Any unrelated interaction disarms it.
+        update(&mut app, Message::Git(GitMessage::StageChecked));
+        assert!(!app.discard_armed);
+    }
+
+    #[test]
+    fn toggling_a_checkbox_adds_then_removes_it() {
+        let mut app = App::new();
+        let toggle = || {
+            Message::Ui(UiMessage::ToggleChecked {
+                path: "a.txt".to_string(),
+                staged: false,
+            })
+        };
+
+        update(&mut app, toggle());
+        assert!(app.checked.contains(&Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        }));
+
+        update(&mut app, toggle());
+        assert!(app.checked.is_empty());
+    }
+
+    #[test]
+    fn toggle_section_checks_all_then_clears() {
+        let mut app = App::new();
+        app.repo.unstaged = vec![
+            entry("a.txt", ChangeKind::Modified),
+            entry("b.txt", ChangeKind::Modified),
+        ];
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ToggleSection { staged: false }),
+        );
+        assert_eq!(app.checked.len(), 2);
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ToggleSection { staged: false }),
+        );
+        assert!(app.checked.is_empty());
+    }
+
+    #[test]
+    fn refresh_prunes_checked_files_that_disappeared() {
+        let mut app = App::new();
+        app.checked.insert(Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        });
+
+        // A refresh where "a.txt" is no longer unstaged drops it from the set.
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::StatusLoaded {
+                unstaged: vec![],
+                staged: vec![],
+            }),
+        );
+        assert!(app.checked.is_empty());
     }
 
     #[test]

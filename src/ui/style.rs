@@ -4,7 +4,7 @@
 //! as layout, and the look can be retuned in a single place.
 
 use iced::theme::Palette;
-use iced::widget::{button, container, text_input};
+use iced::widget::{button, checkbox, container, text_input};
 use iced::{Background, Border, Color, Theme};
 
 // ── Palette ──────────────────────────────────────────────────────────────
@@ -132,6 +132,28 @@ pub fn dot(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// A file-selection checkbox: accent-filled when checked.
+pub fn check(_theme: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let checked = matches!(
+        status,
+        checkbox::Status::Active { is_checked: true }
+            | checkbox::Status::Hovered { is_checked: true }
+            | checkbox::Status::Disabled { is_checked: true }
+    );
+    let hovered = matches!(status, checkbox::Status::Hovered { .. });
+
+    checkbox::Style {
+        background: Background::Color(if checked { ACCENT } else { BG_ELEVATED }),
+        icon_color: Color::WHITE,
+        border: Border {
+            color: if checked || hovered { ACCENT } else { BORDER },
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        text_color: None,
+    }
+}
+
 /// A small colored count/letter chip.
 pub fn chip(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
@@ -179,21 +201,34 @@ pub fn file_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::S
     }
 }
 
-/// The small `+` / `−` action button on a row.
-pub fn action(_theme: &Theme, status: button::Status) -> button::Style {
-    let (background, text_color) = match status {
-        button::Status::Hovered | button::Status::Pressed => (ACCENT, Color::WHITE),
-        _ => (BG_ELEVATED, TEXT_MUTED),
+/// A borderless "ghost" text button for bulk header actions.
+pub fn ghost(_theme: &Theme, status: button::Status) -> button::Style {
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => Some(Background::Color(BG_HOVER)),
+        _ => None,
     };
 
     button::Style {
-        background: Some(Background::Color(background)),
+        background,
+        text_color: TEXT_MUTED,
+        border: radius(6.0),
+        ..button::Style::default()
+    }
+}
+
+/// A ghost button for a destructive bulk action (red text, red wash on hover).
+pub fn ghost_danger(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            (Some(Background::Color(with_alpha(RED, 0.18))), RED)
+        }
+        _ => (None, with_alpha(RED, 0.85)),
+    };
+
+    button::Style {
+        background,
         text_color,
-        border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: 7.0.into(),
-        },
+        border: radius(6.0),
         ..button::Style::default()
     }
 }

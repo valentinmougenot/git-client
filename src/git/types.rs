@@ -16,8 +16,17 @@ pub enum GitCommand {
     LoadDiff { path: String, staged: bool },
     /// Move an Unstaged or Untracked File into the Staging Area.
     StageFile(String),
+    /// Move every Unstaged and Untracked File into the Staging Area.
+    StageAll,
     /// Remove a Staged File from the Staging Area.
     UnstageFile(String),
+    /// Empty the Staging Area, returning everything to the Working Tree.
+    UnstageAll,
+    /// Discard Working Tree changes for one file: revert a tracked file to its
+    /// committed/staged state, or delete an Untracked File (nothing to revert).
+    Discard(String),
+    /// Discard all Working Tree changes (revert tracked files, delete untracked).
+    DiscardAll,
     /// Persist the Staging Area as a new Commit with the given message.
     Commit(String),
     /// Push local Commits on the current branch to the Remote.

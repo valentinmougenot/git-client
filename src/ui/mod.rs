@@ -6,10 +6,10 @@
 
 mod style;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
 use iced::{Center, Element, Fill, Font, Length};
 
-use crate::app::{App, CommitState, GitMessage, Message, RepoState, UiMessage};
+use crate::app::{App, CommitState, GitMessage, Message, RepoState, Selection, UiMessage};
 use crate::git::{ChangeKind, DiffLine, DiffLineKind, FileEntry};
 
 /// The application's custom dark [`iced::Theme`].
@@ -19,7 +19,7 @@ pub fn theme() -> iced::Theme {
 
 /// The three-panel layout plus the Status Bar, on the window background.
 pub fn root(app: &App) -> Element<'_, Message> {
-    let files = container(file_list(&app.repo))
+    let files = container(file_list(app))
         .style(style::panel)
         .width(Length::FillPortion(2))
         .height(Fill);
@@ -50,26 +50,30 @@ pub fn root(app: &App) -> Element<'_, Message> {
 
 // ── File List ────────────────────────────────────────────────────────────
 
-/// The left column: Unstaged/Untracked files on top, Staged files below.
-fn file_list(repo: &RepoState) -> Element<'_, Message> {
+/// The left column: an action toolbar, then Unstaged files and Staged files.
+/// Checkboxes pick the action targets; clicking a name shows its Diff.
+fn file_list(app: &App) -> Element<'_, Message> {
+    let repo = &app.repo;
     let mut items: Vec<Element<Message>> = Vec::new();
 
-    items.push(list_header("Unstaged", repo.unstaged.len(), style::YELLOW));
+    items.push(action_toolbar(app));
+
+    items.push(section_header(app, "Unstaged", style::YELLOW, false));
     if repo.unstaged.is_empty() {
         items.push(placeholder("Working tree is clean"));
     } else {
         for entry in &repo.unstaged {
-            items.push(file_row(repo, entry, false));
+            items.push(file_row(app, entry, false));
         }
     }
 
     items.push(gap(10.0));
-    items.push(list_header("Staged", repo.staged.len(), style::GREEN));
+    items.push(section_header(app, "Staged", style::GREEN, true));
     if repo.staged.is_empty() {
         items.push(placeholder("Nothing staged"));
     } else {
         for entry in &repo.staged {
-            items.push(file_row(repo, entry, true));
+            items.push(file_row(app, entry, true));
         }
     }
 
@@ -78,35 +82,143 @@ fn file_list(repo: &RepoState) -> Element<'_, Message> {
         .into()
 }
 
-/// A section heading with a colored count chip.
-fn list_header<'a>(label: &str, count: usize, color: iced::Color) -> Element<'a, Message> {
-    let chip = container(text(count.to_string()).size(11).color(color))
+/// The bulk action bar. Each button acts on the checked files of its side, or
+/// on all of them when nothing is checked (the label reflects which).
+fn action_toolbar(app: &App) -> Element<'_, Message> {
+    let unstaged_checked = app.checked.iter().filter(|s| !s.staged).count();
+    let staged_checked = app.checked.iter().filter(|s| s.staged).count();
+
+    let stage = toolbar_button(
+        &count_label("Stage", unstaged_checked),
+        GitMessage::StageChecked,
+        Tone::Normal,
+        !app.repo.unstaged.is_empty(),
+    );
+    let unstage = toolbar_button(
+        &count_label("Unstage", staged_checked),
+        GitMessage::UnstageChecked,
+        Tone::Normal,
+        !app.repo.staged.is_empty(),
+    );
+    let discard_label = if app.discard_armed {
+        "Confirm?".to_string()
+    } else {
+        count_label("Discard", unstaged_checked)
+    };
+    let discard = toolbar_button(
+        &discard_label,
+        GitMessage::DiscardChecked,
+        Tone::Danger,
+        !app.repo.unstaged.is_empty(),
+    );
+
+    container(row![stage, unstage, discard].spacing(6))
+        .padding([2, 4])
+        .into()
+}
+
+/// "Stage all" when nothing is checked, otherwise e.g. "Stage (3)".
+fn count_label(verb: &str, checked: usize) -> String {
+    if checked == 0 {
+        format!("{verb} all")
+    } else {
+        format!("{verb} ({checked})")
+    }
+}
+
+enum Tone {
+    Normal,
+    Danger,
+}
+
+fn toolbar_button<'a>(
+    label: &str,
+    message: GitMessage,
+    tone: Tone,
+    enabled: bool,
+) -> Element<'a, Message> {
+    let style = match tone {
+        Tone::Normal => style::ghost as fn(&iced::Theme, button::Status) -> button::Style,
+        Tone::Danger => style::ghost_danger,
+    };
+    button(text(label.to_string()).size(12))
+        .on_press_maybe(enabled.then_some(Message::Git(message)))
+        .padding([4, 10])
+        .style(style)
+        .into()
+}
+
+/// A section heading: a "select all" checkbox, the label, and a count chip.
+fn section_header<'a>(
+    app: &App,
+    label: &str,
+    color: iced::Color,
+    staged: bool,
+) -> Element<'a, Message> {
+    let list = if staged {
+        &app.repo.staged
+    } else {
+        &app.repo.unstaged
+    };
+    let all_checked = !list.is_empty()
+        && list.iter().all(|entry| {
+            app.checked.contains(&Selection {
+                path: entry.path.clone(),
+                staged,
+            })
+        });
+
+    let select_all = checkbox(all_checked)
+        .on_toggle_maybe(
+            (!list.is_empty()).then_some(move |_| Message::Ui(UiMessage::ToggleSection { staged })),
+        )
+        .size(15)
+        .style(style::check);
+
+    let chip = container(text(list.len().to_string()).size(11).color(color))
         .style(style::chip(color))
         .padding([1, 7]);
 
-    row![
-        text(label.to_uppercase()).size(11).color(style::TEXT_MUTED),
-        chip,
-    ]
-    .spacing(8)
-    .align_y(Center)
+    container(
+        row![
+            select_all,
+            text(label.to_uppercase()).size(11).color(style::TEXT_MUTED),
+            chip,
+        ]
+        .spacing(8)
+        .align_y(Center),
+    )
     .padding([6, 4])
     .into()
 }
 
 fn placeholder<'a>(label: &str) -> Element<'a, Message> {
     container(text(label.to_string()).size(13).color(style::TEXT_FAINT))
-        .padding([4, 12])
+        .padding([4, 30])
         .into()
 }
 
-/// One file: a change badge + filename (the selectable area) and a
-/// Stage/Unstage action button.
-fn file_row<'a>(repo: &RepoState, entry: &FileEntry, staged: bool) -> Element<'a, Message> {
-    let selected = repo
-        .selected
-        .as_ref()
-        .is_some_and(|s| s.path == entry.path && s.staged == staged);
+/// One file: a checkbox (action target), a colored status dot, and the
+/// filename (clicking it shows the Diff).
+fn file_row<'a>(app: &App, entry: &FileEntry, staged: bool) -> Element<'a, Message> {
+    let item = Selection {
+        path: entry.path.clone(),
+        staged,
+    };
+    let active = app.repo.selected.as_ref() == Some(&item);
+    let is_checked = app.checked.contains(&item);
+
+    // Own the path so the toggle closure doesn't borrow `entry`.
+    let toggle_path = entry.path.clone();
+    let check = checkbox(is_checked)
+        .on_toggle(move |_| {
+            Message::Ui(UiMessage::ToggleChecked {
+                path: toggle_path.clone(),
+                staged,
+            })
+        })
+        .size(15)
+        .style(style::check);
 
     // A small colored status dot reads as an icon and avoids a confusing "?"
     // glyph for untracked files. Color encodes the change (see `badge_color`).
@@ -115,7 +227,7 @@ fn file_row<'a>(repo: &RepoState, entry: &FileEntry, staged: bool) -> Element<'a
         .height(Length::Fixed(9.0))
         .style(style::dot(badge_color(entry.change)));
 
-    let label = button(
+    let name = button(
         row![dot, text(entry.path.clone()).size(14)]
             .spacing(10)
             .align_y(Center),
@@ -126,22 +238,9 @@ fn file_row<'a>(repo: &RepoState, entry: &FileEntry, staged: bool) -> Element<'a
     }))
     .width(Fill)
     .padding([6, 8])
-    .style(style::file_item(selected));
+    .style(style::file_item(active));
 
-    let action = button(
-        text(if staged { "−" } else { "+" })
-            .size(15)
-            .font(Font::MONOSPACE),
-    )
-    .on_press(Message::Git(if staged {
-        GitMessage::Unstage(entry.path.clone())
-    } else {
-        GitMessage::Stage(entry.path.clone())
-    }))
-    .padding([4, 10])
-    .style(style::action);
-
-    row![label, action].spacing(6).align_y(Center).into()
+    row![check, name].spacing(8).align_y(Center).into()
 }
 
 fn badge_color(change: ChangeKind) -> iced::Color {
