@@ -158,10 +158,16 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_branches(repo, events);
         }
-        GitCommand::Push => match push(repo) {
-            Ok(()) => events.emit(GitEvent::Pushed),
-            Err(error) => events.emit(GitEvent::Error(error)),
-        },
+        GitCommand::Push => {
+            match push(repo) {
+                Ok(()) => events.emit(GitEvent::Pushed),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // A first push sets the upstream and resets ahead/behind, so refresh
+            // the branch context and list.
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
         GitCommand::Pull => {
             match pull(repo) {
                 Ok(()) => events.emit(GitEvent::Pulled),
@@ -692,7 +698,9 @@ fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2
     })
 }
 
-/// Push the current branch to `origin` over SSH.
+/// Push the current branch to `origin` over SSH. When the branch has no
+/// upstream yet, this also configures one (`git push -u`), so subsequent pushes,
+/// pulls, and the ahead/behind counts work without further setup.
 fn push(repo: &Repository) -> Result<(), GitError> {
     let branch = current_branch(repo)?;
     let mut remote = repo
@@ -707,7 +715,33 @@ fn push(repo: &Repository) -> Result<(), GitError> {
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     remote
         .push(&[refspec.as_str()], Some(&mut options))
-        .map_err(|error| GitError::new("push", &error))
+        .map_err(|error| GitError::new("push", &error))?;
+
+    ensure_upstream(repo, &branch)
+}
+
+/// Make `branch` track `origin/<branch>` if it doesn't already. The push above
+/// has just landed the commit on the remote, so the remote-tracking ref is
+/// synced to the local tip before tracking is configured (libgit2 needs that ref
+/// to exist to set up the relationship).
+fn ensure_upstream(repo: &Repository, branch: &str) -> Result<(), GitError> {
+    let mut local = repo
+        .find_branch(branch, git2::BranchType::Local)
+        .map_err(|error| GitError::new("find branch", &error))?;
+    if local.upstream().is_ok() {
+        return Ok(());
+    }
+
+    let oid = local
+        .get()
+        .target()
+        .ok_or_else(|| GitError::custom("push", "the branch has no commit to track"))?;
+    let tracking = format!("refs/remotes/origin/{branch}");
+    repo.reference(&tracking, oid, true, "push: update remote-tracking branch")
+        .map_err(|error| GitError::new("update remote-tracking branch", &error))?;
+    local
+        .set_upstream(Some(&format!("origin/{branch}")))
+        .map_err(|error| GitError::new("set upstream", &error))
 }
 
 /// Fetch from `origin` and fast-forward the current branch.
@@ -1627,6 +1661,39 @@ mod tests {
         let branches = events.last_branches();
         assert!(branches.iter().any(|b| b.is_remote && b.name == "origin/feature"));
         assert!(events.events().iter().any(|e| matches!(e, GitEvent::Fetched)));
+    }
+
+    #[test]
+    fn push_sets_upstream_for_a_branch_without_one() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        repo.remote("origin", remote.path().to_str().unwrap()).unwrap();
+
+        let current = repo.head().unwrap().shorthand().unwrap().to_string();
+        // No upstream before the push.
+        assert!(
+            repo.find_branch(&current, git2::BranchType::Local)
+                .unwrap()
+                .upstream()
+                .is_err()
+        );
+
+        process(&repo, GitCommand::Push, &events);
+
+        // The push succeeded and the branch now tracks origin/<branch>.
+        assert!(events.events().iter().any(|e| matches!(e, GitEvent::Pushed)));
+        let upstream = repo
+            .find_branch(&current, git2::BranchType::Local)
+            .unwrap()
+            .upstream()
+            .expect("expected an upstream after push");
+        assert_eq!(upstream.name().unwrap(), Some(format!("origin/{current}").as_str()));
+        // The branch context now reports the upstream too.
+        assert_eq!(events.last_head().upstream.as_deref(), Some(format!("origin/{current}").as_str()));
     }
 
     #[test]
