@@ -169,6 +169,16 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_status(repo, events);
         }
+        GitCommand::Fetch => {
+            match fetch(repo) {
+                Ok(()) => events.emit(GitEvent::Fetched),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // Fetching moves the remote-tracking refs and the ahead/behind
+            // counts, so refresh both the status context and the branch list.
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
     }
 }
 
@@ -690,7 +700,7 @@ fn push(repo: &Repository) -> Result<(), GitError> {
         .map_err(|error| GitError::new("find remote 'origin'", &error))?;
 
     let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(ssh_credentials);
+    callbacks.credentials(ssh_credentials_callback());
     let mut options = PushOptions::new();
     options.remote_callbacks(callbacks);
 
@@ -711,7 +721,7 @@ fn pull(repo: &Repository) -> Result<(), GitError> {
         .map_err(|error| GitError::new("find remote 'origin'", &error))?;
 
     let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(ssh_credentials);
+    callbacks.credentials(ssh_credentials_callback());
     let mut options = FetchOptions::new();
     options.remote_callbacks(callbacks);
 
@@ -751,6 +761,26 @@ fn pull(repo: &Repository) -> Result<(), GitError> {
         .map_err(|error| GitError::new("update HEAD", &error))?;
     repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
         .map_err(|error| GitError::new("checkout", &error))
+}
+
+/// Fetch from `origin`, updating every remote-tracking branch (and pruning ones
+/// deleted upstream) without touching the Working Tree or merging. Uses the
+/// remote's configured refspecs (an empty list), so all `origin/*` refs refresh.
+fn fetch(repo: &Repository) -> Result<(), GitError> {
+    let mut remote = repo
+        .find_remote("origin")
+        .map_err(|error| GitError::new("find remote 'origin'", &error))?;
+
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(ssh_credentials_callback());
+    let mut options = FetchOptions::new();
+    options.remote_callbacks(callbacks);
+    options.prune(git2::FetchPrune::On);
+
+    let refspecs: &[&str] = &[];
+    remote
+        .fetch(refspecs, Some(&mut options), None)
+        .map_err(|error| GitError::new("fetch", &error))
 }
 
 /// Read the local branches and emit them, or surface the failure.
@@ -905,6 +935,29 @@ fn current_branch(repo: &Repository) -> Result<String, GitError> {
     head.shorthand()
         .map(str::to_string)
         .map_err(|error| GitError::new("current branch", &error))
+}
+
+/// A credentials callback for an SSH remote, hardened against libgit2's retry
+/// loop. libgit2 re-invokes the callback every time a credential is rejected; if
+/// we kept handing back the same key it would spin forever (a hang in the UI).
+/// So this answers a username request, offers the key exactly once, and then
+/// returns an error — turning a rejected key into a surfaced failure.
+fn ssh_credentials_callback()
+-> impl FnMut(&str, Option<&str>, CredentialType) -> Result<Cred, git2::Error> {
+    let mut key_attempts = 0;
+    move |url, username, allowed| {
+        // Some URLs make libgit2 ask for the username on its own first.
+        if allowed.contains(CredentialType::USERNAME) {
+            return Cred::username(username.unwrap_or("git"));
+        }
+        key_attempts += 1;
+        if key_attempts > 1 {
+            return Err(git2::Error::from_str(
+                "SSH authentication failed: the agent and ~/.ssh default keys were rejected",
+            ));
+        }
+        ssh_credentials(url, username, allowed)
+    }
 }
 
 /// Provide SSH credentials: the agent first, then the default key files.
@@ -1527,6 +1580,53 @@ mod tests {
             .find(|b| b.name == "feature" && !b.is_remote)
             .expect("expected a local feature branch");
         assert_eq!(feature.upstream.as_deref(), Some("origin/feature"));
+    }
+
+    #[test]
+    fn fetch_updates_remote_tracking_branches() {
+        // A bare repo standing in for `origin`.
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+
+        // Publish both heads to the remote (local path, so no credentials).
+        let current = repo.head().unwrap().shorthand().unwrap().to_string();
+        let mut origin = repo.remote("origin", remote.path().to_str().unwrap()).unwrap();
+        origin
+            .push(
+                &[
+                    format!("refs/heads/{current}:refs/heads/{current}"),
+                    "refs/heads/feature:refs/heads/feature".to_string(),
+                ],
+                None,
+            )
+            .unwrap();
+
+        // Drop any tracking refs the push created locally, so the fetch is what
+        // restores them.
+        let tracking: Vec<String> = repo
+            .references_glob("refs/remotes/origin/*")
+            .unwrap()
+            .names()
+            .filter_map(Result::ok)
+            .map(str::to_string)
+            .collect();
+        for name in tracking {
+            repo.find_reference(&name).unwrap().delete().unwrap();
+        }
+        process(&repo, GitCommand::LoadBranches, &events);
+        assert!(events.last_branches().iter().all(|b| !b.is_remote));
+
+        process(&repo, GitCommand::Fetch, &events);
+
+        let branches = events.last_branches();
+        assert!(branches.iter().any(|b| b.is_remote && b.name == "origin/feature"));
+        assert!(events.events().iter().any(|e| matches!(e, GitEvent::Fetched)));
     }
 
     #[test]

@@ -146,11 +146,12 @@ fn top_bar(app: &App) -> Element<'_, Message> {
     };
 
     let refresh = pill("⟳", 17, "", GitMessage::Refresh, Tone::Normal, true);
+    let fetch = pill("↧", 14, "Fetch", GitMessage::Fetch, Tone::Normal, can_remote);
     let pull = pill("↓", 14, &pull_label, GitMessage::Pull, Tone::Normal, can_remote);
     let push = pill("↑", 14, &push_label, GitMessage::Push, Tone::Normal, can_remote);
 
     container(
-        row![brand, space::horizontal(), refresh, pull, push]
+        row![brand, space::horizontal(), refresh, fetch, pull, push]
             .spacing(8)
             .align_y(Center),
     )

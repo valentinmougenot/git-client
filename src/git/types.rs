@@ -54,6 +54,8 @@ pub enum GitCommand {
     Push,
     /// Pull Remote changes into the current branch.
     Pull,
+    /// Update the remote-tracking branches from `origin` without merging.
+    Fetch,
 }
 
 /// The result of a completed [`GitCommand`], sent from the Git Worker to the UI.
@@ -84,6 +86,8 @@ pub enum GitEvent {
     Pushed,
     /// A Pull completed successfully.
     Pulled,
+    /// A Fetch completed successfully.
+    Fetched,
     /// Any operation failed.
     Error(GitError),
 }

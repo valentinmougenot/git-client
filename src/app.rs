@@ -223,6 +223,8 @@ pub enum GitMessage {
     DeleteBranch(String),
     Push,
     Pull,
+    /// Update remote-tracking branches from the Remote without merging.
+    Fetch,
 }
 
 impl App {
@@ -408,6 +410,7 @@ impl App {
             }
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
+            GitMessage::Fetch => self.start_remote("Fetching…", GitCommand::Fetch),
         }
     }
 
@@ -547,6 +550,10 @@ impl App {
             GitEvent::Pulled => {
                 self.operation = None;
                 self.notify("Pulled from remote".to_string());
+            }
+            GitEvent::Fetched => {
+                self.operation = None;
+                self.notify("Fetched from remote".to_string());
             }
             GitEvent::Error(error) => {
                 self.commit.committing = false;
@@ -786,6 +793,7 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Character("u") if command => Message::Git(GitMessage::UnstageSelected),
         Key::Character("p") if command && modifiers.shift() => Message::Git(GitMessage::Pull),
         Key::Character("p") if command => Message::Git(GitMessage::Push),
+        Key::Character("f") if command => Message::Git(GitMessage::Fetch),
         _ => Message::Ignored,
     }
 }
