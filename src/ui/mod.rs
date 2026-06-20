@@ -4,15 +4,17 @@
 //! emit [`Message`]s. It never touches git2 directly — only the message types.
 //! All color and surface treatment lives in [`style`].
 
+mod graph;
 mod highlight;
 mod style;
 mod tree;
 mod worddiff;
 
+use iced::widget::canvas;
 use iced::widget::{
     button, checkbox, column, container, rich_text, row, scrollable, space, span, text, text_input,
 };
-use iced::{Center, Element, Fill, Font, Length};
+use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
 use crate::git::{ChangeKind, CommitInfo, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo};
@@ -529,31 +531,55 @@ fn badge_color(change: ChangeKind) -> iced::Color {
 
 // ── History List ─────────────────────────────────────────────────────────
 
-/// The left column in the History view: the recent Commits, newest first.
+/// Fixed height of a commit row, so the graph cells stack edge-to-edge and their
+/// lane lines join across rows.
+const COMMIT_ROW_H: f32 = 46.0;
+/// Horizontal pitch between graph lanes.
+const LANE_W: f32 = 16.0;
+
+/// The left column in the History view: the recent Commits as a graph, newest
+/// first. The graph lanes are laid out once, then each row draws its own cell.
 fn history_list(history: &HistoryState) -> Element<'_, Message> {
     if history.commits.is_empty() {
         return container(placeholder("No commits yet")).height(Fill).into();
     }
 
+    let nodes: Vec<graph::Commit> = history
+        .commits
+        .iter()
+        .map(|commit| graph::Commit {
+            sha: &commit.sha,
+            parents: &commit.parents,
+        })
+        .collect();
+    let layout = graph::layout(&nodes);
+    // One width for every cell so the commit text lines up in a single column.
+    let lanes = layout.iter().map(|row| row.lanes).max().unwrap_or(1).max(1);
+
     let rows: Vec<Element<Message>> = history
         .commits
         .iter()
-        .map(|commit| commit_row(commit, history.selected.as_deref()))
+        .zip(layout)
+        .map(|(commit, row)| commit_row(commit, history.selected.as_deref(), row, lanes))
         .collect();
 
-    scrollable(column(rows).spacing(3).padding(12))
-        .height(Fill)
-        .into()
+    // No inter-row spacing: rows touch so the lane lines are continuous.
+    scrollable(column(rows).padding(12)).height(Fill).into()
 }
 
-/// One Commit in the History list: short SHA, summary, and author · time.
-fn commit_row<'a>(commit: &CommitInfo, selected: Option<&str>) -> Element<'a, Message> {
+/// One Commit in the History list: its graph cell, then short SHA, summary, and
+/// author · time.
+fn commit_row<'a>(
+    commit: &CommitInfo,
+    selected: Option<&str>,
+    row: graph::Row,
+    lanes: usize,
+) -> Element<'a, Message> {
     let active = selected == Some(commit.sha.as_str());
 
-    let bar = container(text(""))
-        .width(Length::Fixed(3.0))
-        .height(Length::Fixed(30.0))
-        .style(style::selection_bar(active));
+    let cell = canvas(GraphCell { row })
+        .width(Length::Fixed(lanes as f32 * LANE_W))
+        .height(Length::Fixed(COMMIT_ROW_H));
 
     let meta = format!("{} · {}", commit.author, relative_time(commit.time));
     let body = column![
@@ -570,12 +596,68 @@ fn commit_row<'a>(commit: &CommitInfo, selected: Option<&str>) -> Element<'a, Me
     ]
     .spacing(2);
 
-    button(row![bar, body].spacing(10).align_y(Center))
+    let body = button(body)
         .on_press(Message::Ui(UiMessage::CommitSelected(commit.sha.clone())))
         .width(Fill)
         .padding([7, 8])
-        .style(style::file_item(active))
+        .style(style::file_item(active));
+
+    container(row![cell, body].spacing(6).align_y(Center))
+        .height(Length::Fixed(COMMIT_ROW_H))
         .into()
+}
+
+/// Draws one commit row's graph cell: the lane lines entering from the top and
+/// leaving to the bottom, plus the commit's node.
+struct GraphCell {
+    row: graph::Row,
+}
+
+impl canvas::Program<Message> for GraphCell {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let center_y = bounds.height / 2.0;
+        let lane_x = |lane: usize| lane as f32 * LANE_W + LANE_W / 2.0;
+        let stroke = |color: usize| {
+            canvas::Stroke::default()
+                .with_width(1.6)
+                .with_color(lane_color(color))
+        };
+
+        for edge in &self.row.top {
+            let path = canvas::Path::new(|builder| {
+                builder.move_to(Point::new(lane_x(edge.from), 0.0));
+                builder.line_to(Point::new(lane_x(edge.to), center_y));
+            });
+            frame.stroke(&path, stroke(edge.color));
+        }
+        for edge in &self.row.bottom {
+            let path = canvas::Path::new(|builder| {
+                builder.move_to(Point::new(lane_x(edge.from), center_y));
+                builder.line_to(Point::new(lane_x(edge.to), bounds.height));
+            });
+            frame.stroke(&path, stroke(edge.color));
+        }
+
+        let node = canvas::Path::circle(Point::new(lane_x(self.row.node_lane), center_y), 4.0);
+        frame.fill(&node, lane_color(self.row.node_color));
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// The color for a graph lane, cycling through the lane palette.
+fn lane_color(index: usize) -> iced::Color {
+    style::LANE_COLORS[index % style::LANE_COLORS.len()]
 }
 
 // ── Commit Detail ────────────────────────────────────────────────────────

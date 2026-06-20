@@ -570,7 +570,9 @@ fn load_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, git2
     if walk.push_head().is_err() {
         return Ok(Vec::new());
     }
-    walk.set_sorting(git2::Sort::TIME)?;
+    // Topological ordering (with time as the tie-breaker) guarantees a Commit is
+    // always listed before its parents, which the graph layout relies on.
+    walk.set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)?;
 
     let mut commits = Vec::new();
     for oid in walk.take(limit) {
@@ -582,6 +584,7 @@ fn load_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, git2
             summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
             author: commit.author().name().unwrap_or_default().to_string(),
             time: commit.time().seconds(),
+            parents: commit.parent_ids().map(|id| id.to_string()).collect(),
         });
     }
     Ok(commits)

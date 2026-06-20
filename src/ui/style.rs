@@ -74,6 +74,10 @@ pub const GREEN_BG_STRONG: Color = Color::from_rgba(0.34191, 0.61721, 0.14413, 0
 /// Stronger tint behind the precise words removed within a deletion line.
 pub const RED_BG_STRONG: Color = Color::from_rgba(0.93011, 0.18116, 0.27050, 0.30);
 
+/// The cycle of colors for commit-graph lanes, so each branch reads distinctly.
+/// Indexed by lane (see `graph::COLORS`).
+pub const LANE_COLORS: [Color; 6] = [ACCENT, GREEN, SYN_KEYWORD, YELLOW, INFO, RED];
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn radius(value: f32) -> Border {

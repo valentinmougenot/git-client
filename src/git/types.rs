@@ -114,6 +114,9 @@ pub struct CommitInfo {
     pub author: String,
     /// Commit time, Unix seconds (formatted relative to now in the UI).
     pub time: i64,
+    /// The full SHAs of this Commit's parents, in order (first parent first).
+    /// Used to lay out the commit graph; a merge has more than one.
+    pub parents: Vec<String>,
 }
 
 /// A single Commit's metadata and full Diff, shown when one is selected in the
