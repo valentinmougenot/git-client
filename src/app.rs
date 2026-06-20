@@ -85,6 +85,8 @@ pub struct BranchesState {
     pub new_name: String,
     /// The branch awaiting a confirming second Delete press, if any.
     pub delete_armed: Option<String>,
+    /// Whether Prune is armed, awaiting a confirming second press.
+    pub prune_armed: bool,
 }
 
 /// Working Tree and Staging Area contents, the HEAD/branch context, the
@@ -221,6 +223,9 @@ pub enum GitMessage {
     /// Delete the named branch. First press arms a confirmation; the second
     /// performs it.
     DeleteBranch(String),
+    /// Delete all local branches absent from the Remote. First press arms a
+    /// confirmation; the second performs it.
+    PruneBranches,
     Push,
     Pull,
     /// Update remote-tracking branches from the Remote without merging.
@@ -259,10 +264,11 @@ impl App {
     }
 
     fn update_ui(&mut self, message: UiMessage) {
-        // Interacting elsewhere cancels a pending Discard or branch-delete
-        // confirmation.
+        // Interacting elsewhere cancels a pending Discard, branch-delete, or
+        // prune confirmation.
         self.discard_armed = false;
         self.branches.delete_armed = None;
+        self.branches.prune_armed = false;
 
         match message {
             UiMessage::FileSelected { path, staged } => self.select(path, staged),
@@ -318,6 +324,10 @@ impl App {
         // deletion.
         if !matches!(message, GitMessage::DeleteBranch(_)) {
             self.branches.delete_armed = None;
+        }
+        // And anything but pressing Prune again cancels an armed prune.
+        if !matches!(message, GitMessage::PruneBranches) {
+            self.branches.prune_armed = false;
         }
 
         match message {
@@ -406,6 +416,15 @@ impl App {
                     self.dispatch(GitCommand::DeleteBranch(name));
                 } else {
                     self.branches.delete_armed = Some(name);
+                }
+            }
+            GitMessage::PruneBranches => {
+                // First press arms; the confirming second prunes.
+                if self.branches.prune_armed {
+                    self.branches.prune_armed = false;
+                    self.dispatch(GitCommand::PruneBranches);
+                } else {
+                    self.branches.prune_armed = true;
                 }
             }
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
@@ -542,6 +561,14 @@ impl App {
             GitEvent::BranchDeleted(name) => {
                 self.notify(format!("Deleted {name}"));
                 self.branches.delete_armed = None;
+            }
+            GitEvent::BranchesPruned(pruned) => {
+                self.branches.prune_armed = false;
+                self.notify(match pruned.len() {
+                    0 => "No branches to prune".to_string(),
+                    1 => format!("Pruned {}", pruned[0]),
+                    n => format!("Pruned {n} branches"),
+                });
             }
             GitEvent::Pushed => {
                 self.operation = None;

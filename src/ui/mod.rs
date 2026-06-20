@@ -695,8 +695,21 @@ fn branches_list(app: &App) -> Element<'_, Message> {
         .iter()
         .partition(|branch| !branch.is_remote);
 
+    // Branches absent from the Remote (no resolvable upstream and no matching
+    // `origin/<name>`) can be pruned in bulk.
+    let prunable = locals
+        .iter()
+        .filter(|branch| {
+            !branch.is_head
+                && branch.upstream.is_none()
+                && !remotes
+                    .iter()
+                    .any(|remote| remote.name == format!("origin/{}", branch.name))
+        })
+        .count();
+
     items.push(gap(8.0));
-    items.push(branch_section_label("LOCAL", locals.len()));
+    items.push(local_header(locals.len(), prunable, app.branches.prune_armed));
     if locals.is_empty() {
         items.push(placeholder("No branches yet"));
     } else {
@@ -724,6 +737,30 @@ fn branch_section_label<'a>(label: &str, count: usize) -> Element<'a, Message> {
         .size(11)
         .color(style::TEXT_MUTED)
         .into()
+}
+
+/// The LOCAL section heading, with a Prune action on the right when there are
+/// branches absent from the Remote. The first press arms it ("Delete N?"), the
+/// second performs the cleanup.
+fn local_header<'a>(count: usize, prunable: usize, armed: bool) -> Element<'a, Message> {
+    let mut header = row![branch_section_label("LOCAL", count)]
+        .spacing(8)
+        .align_y(Center);
+
+    if prunable > 0 {
+        let label = if armed {
+            format!("Delete {prunable}?")
+        } else {
+            format!("Prune {prunable}")
+        };
+        let prune = button(text(label).size(11))
+            .on_press(Message::Git(GitMessage::PruneBranches))
+            .padding([2, 9])
+            .style(style::secondary_danger);
+        header = header.push(space::horizontal()).push(prune);
+    }
+
+    container(header).width(Fill).into()
 }
 
 /// One branch: a current-branch marker, its name, its sync state, and — for any

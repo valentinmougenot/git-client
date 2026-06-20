@@ -50,6 +50,9 @@ pub enum GitCommand {
     CreateBranch(String),
     /// Delete the named local branch (never the current one).
     DeleteBranch(String),
+    /// Delete every local branch that has no counterpart on the Remote (never
+    /// the current one) — a cleanup of branches gone or never pushed.
+    PruneBranches,
     /// Push local Commits on the current branch to the Remote.
     Push,
     /// Pull Remote changes into the current branch.
@@ -82,6 +85,8 @@ pub enum GitEvent {
     CheckedOut(String),
     /// A branch was deleted; carries its name.
     BranchDeleted(String),
+    /// Local branches absent from the Remote were pruned; carries their names.
+    BranchesPruned(Vec<String>),
     /// A Push completed successfully.
     Pushed,
     /// A Pull completed successfully.

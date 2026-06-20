@@ -158,6 +158,15 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_branches(repo, events);
         }
+        GitCommand::PruneBranches => {
+            match prune_branches(repo) {
+                Ok(pruned) => events.emit(GitEvent::BranchesPruned(pruned)),
+                Err(error) => {
+                    events.emit(GitEvent::Error(GitError::new("prune branches", &error)))
+                }
+            }
+            emit_branches(repo, events);
+        }
         GitCommand::Push => {
             match push(repo) {
                 Ok(()) => events.emit(GitEvent::Pushed),
@@ -964,6 +973,50 @@ fn delete_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
         .map_err(|error| GitError::new("delete branch", &error))
 }
 
+/// Delete every local branch that has no counterpart on the Remote — neither a
+/// resolvable upstream nor a same-named `origin/<branch>` — leaving the current
+/// branch untouched. Returns the names actually deleted. Best-effort: a branch
+/// that fails to delete is skipped rather than aborting the whole cleanup.
+///
+/// Accuracy depends on the remote-tracking refs being current, so a Fetch (which
+/// prunes) beforehand makes this match the Remote's real state.
+fn prune_branches(repo: &Repository) -> Result<Vec<String>, git2::Error> {
+    // Collect candidates first; deleting while iterating the branch list would
+    // invalidate it.
+    let mut candidates = Vec::new();
+    for entry in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = entry?;
+        if branch.is_head() {
+            continue;
+        }
+        let Some(name) = branch.name()?.map(str::to_string) else {
+            continue;
+        };
+        if !is_on_remote(repo, &branch, &name) {
+            candidates.push(name);
+        }
+    }
+
+    let mut deleted = Vec::new();
+    for name in candidates {
+        if let Ok(mut branch) = repo.find_branch(&name, git2::BranchType::Local)
+            && branch.delete().is_ok()
+        {
+            deleted.push(name);
+        }
+    }
+    Ok(deleted)
+}
+
+/// Whether a local branch exists on the Remote: it has a resolvable upstream, or
+/// a remote-tracking branch shares its name (`origin/<branch>`).
+fn is_on_remote(repo: &Repository, branch: &git2::Branch, name: &str) -> bool {
+    branch.upstream().is_ok()
+        || repo
+            .find_branch(&format!("origin/{name}"), git2::BranchType::Remote)
+            .is_ok()
+}
+
 /// The short name of the currently checked-out branch.
 fn current_branch(repo: &Repository) -> Result<String, GitError> {
     let head = repo
@@ -1617,6 +1670,35 @@ mod tests {
             .find(|b| b.name == "feature" && !b.is_remote)
             .expect("expected a local feature branch");
         assert_eq!(feature.upstream.as_deref(), Some("origin/feature"));
+    }
+
+    #[test]
+    fn prune_removes_local_branches_absent_from_remote() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let current = repo.head().unwrap().shorthand().unwrap().to_string();
+        let head_oid = repo.head().unwrap().target().unwrap();
+
+        // `gone` exists only locally; `kept` has a matching remote-tracking ref.
+        let head = repo.find_commit(head_oid).unwrap();
+        repo.branch("gone", &head, false).unwrap();
+        repo.branch("kept", &head, false).unwrap();
+        repo.reference("refs/remotes/origin/kept", head_oid, false, "test")
+            .unwrap();
+
+        process(&repo, GitCommand::PruneBranches, &events);
+
+        let names: Vec<String> = events.last_branches().into_iter().map(|b| b.name).collect();
+        assert!(!names.contains(&"gone".to_string()), "gone should be pruned");
+        assert!(names.contains(&"kept".to_string()), "kept is on the remote");
+        assert!(names.contains(&current), "the current branch is never pruned");
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::BranchesPruned(pruned) if pruned == &vec!["gone".to_string()]))
+        );
     }
 
     #[test]
