@@ -354,6 +354,25 @@ pub fn secondary_danger(_theme: &Theme, status: button::Status) -> button::Style
     }
 }
 
+/// A quiet, borderless danger button — a faint red glyph that only gains a soft
+/// red wash on hover. Used for the in-row branch delete, so it stays unobtrusive
+/// until reached for.
+pub fn ghost_danger(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            (Some(Background::Color(with_alpha(RED, 0.18))), RED)
+        }
+        _ => (None, with_alpha(RED, 0.55)),
+    };
+
+    button::Style {
+        background,
+        text_color,
+        border: radius(6.0),
+        ..button::Style::default()
+    }
+}
+
 /// The filled accent Commit button.
 pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
     let background = match status {

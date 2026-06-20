@@ -761,9 +761,10 @@ fn emit_branches(repo: &Repository, events: &impl EventSink) {
     }
 }
 
-/// List the local branches, sorted with the current branch first, then by name.
+/// List the branches: local ones first (current branch first, then by name),
+/// then remote-tracking ones (by name). The `origin/HEAD` alias is skipped.
 fn load_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
-    let mut branches = Vec::new();
+    let mut locals = Vec::new();
     for entry in repo.branches(Some(git2::BranchType::Local))? {
         let (branch, _) = entry?;
         let Some(name) = branch.name()?.map(str::to_string) else {
@@ -771,22 +772,59 @@ fn load_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
         };
         let is_head = branch.is_head();
         let (upstream, ahead, behind) = upstream_divergence(repo, Some(&name));
-        branches.push(BranchInfo {
+        locals.push(BranchInfo {
             name,
+            is_remote: false,
             is_head,
             upstream,
             ahead,
             behind,
         });
     }
-    branches.sort_by(|a, b| b.is_head.cmp(&a.is_head).then_with(|| a.name.cmp(&b.name)));
-    Ok(branches)
+    locals.sort_by(|a, b| b.is_head.cmp(&a.is_head).then_with(|| a.name.cmp(&b.name)));
+
+    let mut remotes = Vec::new();
+    for entry in repo.branches(Some(git2::BranchType::Remote))? {
+        let (branch, _) = entry?;
+        let Some(name) = branch.name()?.map(str::to_string) else {
+            continue;
+        };
+        // `origin/HEAD` is a symbolic alias, not a branch to check out.
+        if name.ends_with("/HEAD") {
+            continue;
+        }
+        remotes.push(BranchInfo {
+            name,
+            is_remote: true,
+            is_head: false,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        });
+    }
+    remotes.sort_by(|a, b| a.name.cmp(&b.name));
+
+    locals.extend(remotes);
+    Ok(locals)
 }
 
-/// Switch HEAD and the Working Tree to an existing local branch. The checkout is
-/// safe: libgit2 refuses it (and we surface the error) if it would overwrite
-/// uncommitted local changes.
+/// Switch to a branch by name. A local branch is checked out directly; a remote
+/// branch name (`origin/feature`) checks out the matching local branch if one
+/// exists, otherwise creates a local tracking branch from it first.
 fn checkout_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
+    if repo.find_branch(name, git2::BranchType::Local).is_ok() {
+        return checkout_local(repo, name);
+    }
+    if let Ok(remote) = repo.find_branch(name, git2::BranchType::Remote) {
+        return checkout_remote(repo, &remote, name);
+    }
+    // Fall back to a direct checkout; surfaces a clear error if unresolvable.
+    checkout_local(repo, name)
+}
+
+/// Check out an existing local branch. The checkout is safe: libgit2 refuses it
+/// (and we surface the error) if it would overwrite uncommitted local changes.
+fn checkout_local(repo: &Repository, name: &str) -> Result<(), GitError> {
     let refname = format!("refs/heads/{name}");
     let object = repo
         .revparse_single(&refname)
@@ -797,6 +835,38 @@ fn checkout_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
     repo.set_head(&refname)
         .map_err(|error| GitError::new("update HEAD", &error))?;
     Ok(())
+}
+
+/// Create a local branch tracking a remote one (`origin/feature` -> `feature`),
+/// then check it out. If the local short name is already taken, switch to it.
+fn checkout_remote(
+    repo: &Repository,
+    remote: &git2::Branch,
+    remote_name: &str,
+) -> Result<(), GitError> {
+    // The local name drops the remote prefix: `origin/feature` -> `feature`.
+    let local_name = remote_name
+        .split_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(remote_name);
+
+    if repo.find_branch(local_name, git2::BranchType::Local).is_ok() {
+        return checkout_local(repo, local_name);
+    }
+
+    let commit = remote
+        .get()
+        .peel_to_commit()
+        .map_err(|error| GitError::new("resolve remote branch", &error))?;
+    let mut local = repo
+        .branch(local_name, &commit, false)
+        .map_err(|error| GitError::new("create tracking branch", &error))?;
+    // Best-effort: configure tracking. It only fails when the remote isn't in
+    // config, which shouldn't happen for a fetched branch; either way, the
+    // switch below should still proceed.
+    let _ = local.set_upstream(Some(remote_name));
+
+    checkout_local(repo, local_name)
 }
 
 /// Create a new local branch at HEAD and switch to it. Fails if the branch
@@ -1414,6 +1484,49 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, GitEvent::BranchDeleted(name) if name == "feature"))
         );
+    }
+
+    #[test]
+    fn load_branches_lists_remote_branches() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let head_oid = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/remotes/origin/feature", head_oid, false, "test")
+            .unwrap();
+
+        process(&repo, GitCommand::LoadBranches, &events);
+
+        let branches = events.last_branches();
+        let remote = branches
+            .iter()
+            .find(|b| b.name == "origin/feature")
+            .expect("expected the remote branch");
+        assert!(remote.is_remote);
+        assert!(!remote.is_head);
+    }
+
+    #[test]
+    fn checking_out_a_remote_branch_creates_a_local_tracking_branch() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        // A configured remote plus a fetched branch ref — as after a real fetch.
+        repo.remote("origin", "https://example.com/repo.git").unwrap();
+        let head_oid = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/remotes/origin/feature", head_oid, false, "test")
+            .unwrap();
+
+        process(&repo, GitCommand::Checkout("origin/feature".into()), &events);
+
+        // A local `feature` now exists, is checked out, and tracks the remote.
+        assert_eq!(events.last_head().branch.as_deref(), Some("feature"));
+        let feature = events
+            .last_branches()
+            .into_iter()
+            .find(|b| b.name == "feature" && !b.is_remote)
+            .expect("expected a local feature branch");
+        assert_eq!(feature.upstream.as_deref(), Some("origin/feature"));
     }
 
     #[test]

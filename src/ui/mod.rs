@@ -12,9 +12,10 @@ mod worddiff;
 
 use iced::widget::canvas;
 use iced::widget::{
-    button, checkbox, column, container, rich_text, row, scrollable, space, span, text, text_input,
+    button, checkbox, column, container, rich_text, row, scrollable, space, span, stack, text,
+    text_input,
 };
-use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Theme};
+use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Right, Theme};
 
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
 use crate::git::{
@@ -686,25 +687,41 @@ fn branches_list(app: &App) -> Element<'_, Message> {
     let create = pill("+", 15, "Create", GitMessage::CreateBranch, Tone::Normal, can_create);
     items.push(row![input, create].spacing(6).align_y(Center).into());
 
-    items.push(gap(8.0));
-    items.push(
-        text(format!("LOCAL ({})", app.branches.branches.len()))
-            .size(11)
-            .color(style::TEXT_MUTED)
-            .into(),
-    );
+    let armed = app.branches.delete_armed.as_deref();
+    let (locals, remotes): (Vec<_>, Vec<_>) = app
+        .branches
+        .branches
+        .iter()
+        .partition(|branch| !branch.is_remote);
 
-    if app.branches.branches.is_empty() {
+    items.push(gap(8.0));
+    items.push(branch_section_label("LOCAL", locals.len()));
+    if locals.is_empty() {
         items.push(placeholder("No branches yet"));
     } else {
-        let armed = app.branches.delete_armed.as_deref();
-        for branch in &app.branches.branches {
+        for branch in locals {
             items.push(branch_row(branch, armed == Some(branch.name.as_str())));
+        }
+    }
+
+    if !remotes.is_empty() {
+        items.push(gap(10.0));
+        items.push(branch_section_label("REMOTE", remotes.len()));
+        for branch in remotes {
+            items.push(branch_row(branch, false));
         }
     }
 
     scrollable(column(items).spacing(4).padding(12))
         .height(Fill)
+        .into()
+}
+
+/// A small uppercase section heading for the Branches list.
+fn branch_section_label<'a>(label: &str, count: usize) -> Element<'a, Message> {
+    text(format!("{label} ({count})"))
+        .size(11)
+        .color(style::TEXT_MUTED)
         .into()
 }
 
@@ -742,11 +759,15 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
     if branch.behind > 0 {
         label = label.push(text(format!("↓{}", branch.behind)).size(11).color(style::YELLOW));
     }
-    if branch.upstream.is_none() {
+    // A local branch with no upstream is marked "local"; remote branches carry
+    // their remote name already, so they need no tag.
+    if !branch.is_remote && branch.upstream.is_none() {
         label = label.push(text("local").size(10).color(style::TEXT_FAINT));
     }
 
-    // The current branch is shown highlighted but is not a switch target.
+    // The whole rectangle switches to the branch (except the current one, which
+    // is not a switch target). Switching to a remote branch creates a local
+    // tracking branch (handled in the worker).
     let select = button(label)
         .on_press_maybe(
             (!branch.is_head).then(|| Message::Git(GitMessage::Checkout(branch.name.clone()))),
@@ -755,19 +776,26 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
         .padding([6, 8])
         .style(style::file_item(branch.is_head));
 
-    let mut layout = row![select].spacing(6).align_y(Center);
-    if !branch.is_head {
-        let label = if armed { "Confirm?" } else { "" };
-        layout = layout.push(pill(
-            "✕",
-            13,
-            label,
-            GitMessage::DeleteBranch(branch.name.clone()),
-            Tone::Danger,
-            true,
-        ));
+    // The current branch and remote branches have no in-row delete.
+    if branch.is_head || branch.is_remote {
+        return select.into();
     }
-    layout.into()
+
+    // A quiet, borderless delete sitting inside the row's rectangle, right-
+    // aligned. Stacked over the switch button so its own clicks are caught while
+    // the rest of the row still triggers the checkout beneath it.
+    let delete = button(text(if armed { "Confirm?" } else { "✕" }).size(if armed { 11 } else { 13 }))
+        .on_press(Message::Git(GitMessage::DeleteBranch(branch.name.clone())))
+        .padding([4, 8])
+        .style(style::ghost_danger);
+    let delete = container(delete)
+        .width(Fill)
+        .height(Fill)
+        .align_x(Right)
+        .center_y(Fill)
+        .padding([0, 6]);
+
+    stack![select, delete].into()
 }
 
 /// The right panel in the Branches view: a short summary of the current branch

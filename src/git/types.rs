@@ -122,8 +122,12 @@ pub struct CommitSummary {
 /// and how it sits relative to its upstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchInfo {
+    /// The branch name: a local short name (`feature`) or, for a remote branch,
+    /// its remote-qualified name (`origin/feature`).
     pub name: String,
-    /// This branch is the currently checked-out HEAD.
+    /// A remote-tracking branch (under `refs/remotes`) rather than a local one.
+    pub is_remote: bool,
+    /// This branch is the currently checked-out HEAD (never set for remotes).
     pub is_head: bool,
     /// The configured upstream tracking branch, if any.
     pub upstream: Option<String>,
