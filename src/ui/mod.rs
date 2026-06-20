@@ -9,43 +9,81 @@ mod style;
 use iced::widget::{button, checkbox, column, container, row, scrollable, space, text, text_input};
 use iced::{Center, Element, Fill, Font, Length};
 
-use crate::app::{App, GitMessage, Message, RepoState, Selection, UiMessage};
-use crate::git::{ChangeKind, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo};
+use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
+use crate::git::{ChangeKind, CommitInfo, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo};
 
 /// The application's custom dark [`iced::Theme`].
 pub fn theme() -> iced::Theme {
     style::theme()
 }
 
-/// The top bar, the three-panel layout, and the Status Bar, on the window
-/// background.
+/// The top bar, the two-view body, and the Status Bar, on the window
+/// background. The body switches between the Changes and History views.
 pub fn root(app: &App) -> Element<'_, Message> {
-    let files = container(file_list(app))
+    let left_body = match app.view {
+        ViewMode::Changes => file_list(app),
+        ViewMode::History => history_list(&app.history),
+    };
+    let left = container(column![view_tabs(app), left_body])
         .style(style::panel)
         .width(Length::FillPortion(2))
         .height(Fill);
 
-    let diff = container(diff_view(&app.repo))
-        .style(style::panel)
-        .width(Fill)
-        .height(Fill);
+    let right: Element<Message> = match app.view {
+        ViewMode::Changes => {
+            let diff = container(diff_view(&app.repo))
+                .style(style::panel)
+                .width(Fill)
+                .height(Fill);
+            let commit = container(commit_panel(app)).style(style::panel).width(Fill);
+            column![diff, commit]
+                .spacing(12)
+                .width(Length::FillPortion(3))
+                .height(Fill)
+                .into()
+        }
+        ViewMode::History => container(commit_detail_view(&app.history))
+            .style(style::panel)
+            .width(Length::FillPortion(3))
+            .height(Fill)
+            .into(),
+    };
 
-    let commit = container(commit_panel(app))
-        .style(style::panel)
-        .width(Fill);
-
-    let right = column![diff, commit]
-        .spacing(12)
-        .width(Length::FillPortion(3))
-        .height(Fill);
-
-    let body = row![files, right].spacing(12).height(Fill);
+    let body = row![left, right].spacing(12).height(Fill);
 
     container(column![top_bar(app), body, status_bar(app)].spacing(12))
         .style(style::app)
         .padding(12)
         .width(Fill)
         .height(Fill)
+        .into()
+}
+
+// ── View Tabs ──────────────────────────────────────────────────────────────
+
+/// The Changes / History switch at the top of the left column.
+fn view_tabs(app: &App) -> Element<'_, Message> {
+    let changes_count = app.repo.unstaged.len() + app.repo.staged.len();
+    let changes_label = if changes_count > 0 {
+        format!("Changes ({changes_count})")
+    } else {
+        "Changes".to_string()
+    };
+
+    let tabs = row![
+        tab(&changes_label, ViewMode::Changes, app.view),
+        tab("History", ViewMode::History, app.view),
+    ]
+    .spacing(4);
+
+    container(tabs).padding([8, 10]).into()
+}
+
+fn tab<'a>(label: &str, target: ViewMode, current: ViewMode) -> Element<'a, Message> {
+    button(text(label.to_string()).size(13))
+        .on_press(Message::Ui(UiMessage::ShowView(target)))
+        .padding([6, 12])
+        .style(style::tab(target == current))
         .into()
 }
 
@@ -372,6 +410,123 @@ fn badge_color(change: ChangeKind) -> iced::Color {
         ChangeKind::Untracked => style::YELLOW,
         ChangeKind::Deleted => style::RED,
         ChangeKind::Modified | ChangeKind::Renamed | ChangeKind::Typechange => style::INFO,
+    }
+}
+
+// ── History List ─────────────────────────────────────────────────────────
+
+/// The left column in the History view: the recent Commits, newest first.
+fn history_list(history: &HistoryState) -> Element<'_, Message> {
+    if history.commits.is_empty() {
+        return container(placeholder("No commits yet")).height(Fill).into();
+    }
+
+    let rows: Vec<Element<Message>> = history
+        .commits
+        .iter()
+        .map(|commit| commit_row(commit, history.selected.as_deref()))
+        .collect();
+
+    scrollable(column(rows).spacing(3).padding(12))
+        .height(Fill)
+        .into()
+}
+
+/// One Commit in the History list: short SHA, summary, and author · time.
+fn commit_row<'a>(commit: &CommitInfo, selected: Option<&str>) -> Element<'a, Message> {
+    let active = selected == Some(commit.sha.as_str());
+
+    let bar = container(text(""))
+        .width(Length::Fixed(3.0))
+        .height(Length::Fixed(30.0))
+        .style(style::selection_bar(active));
+
+    let meta = format!("{} · {}", commit.author, relative_time(commit.time));
+    let body = column![
+        row![
+            text(commit.short_sha.clone())
+                .size(12)
+                .font(Font::MONOSPACE)
+                .color(style::INFO),
+            text(commit.summary.clone()).size(13).color(style::TEXT),
+        ]
+        .spacing(10)
+        .align_y(Center),
+        text(meta).size(11).color(style::TEXT_FAINT),
+    ]
+    .spacing(2);
+
+    button(row![bar, body].spacing(10).align_y(Center))
+        .on_press(Message::Ui(UiMessage::CommitSelected(commit.sha.clone())))
+        .width(Fill)
+        .padding([7, 8])
+        .style(style::file_item(active))
+        .into()
+}
+
+// ── Commit Detail ────────────────────────────────────────────────────────
+
+/// The right panel in the History view: the selected Commit's metadata, full
+/// message, and Diff. Empty when nothing is selected.
+fn commit_detail_view(history: &HistoryState) -> Element<'_, Message> {
+    let Some(detail) = &history.detail else {
+        let label = if history.selected.is_some() {
+            "Loading commit…"
+        } else {
+            "Select a commit to view it"
+        };
+        return container(text(label).size(14).color(style::TEXT_FAINT))
+            .center(Fill)
+            .into();
+    };
+
+    let header = container(
+        column![
+            text(detail.message.trim().to_string()).size(15).color(style::TEXT),
+            row![
+                text(detail.short_sha.clone())
+                    .size(12)
+                    .font(Font::MONOSPACE)
+                    .color(style::INFO),
+                text(format!(
+                    "{} <{}> · {}",
+                    detail.author,
+                    detail.email,
+                    relative_time(detail.time)
+                ))
+                .size(12)
+                .color(style::TEXT_MUTED),
+            ]
+            .spacing(10)
+            .align_y(Center),
+        ]
+        .spacing(8),
+    )
+    .style(style::diff_header)
+    .padding([10, 12])
+    .width(Fill);
+
+    let rows: Vec<Element<Message>> = detail.lines.iter().map(diff_line).collect();
+    let body = scrollable(column(rows).padding([8, 4])).height(Fill).width(Fill);
+
+    column![header, body].spacing(10).padding(12).into()
+}
+
+/// A coarse "time ago" label for a Unix timestamp (seconds).
+fn relative_time(unix_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let diff = (now - unix_secs).max(0);
+
+    match diff {
+        d if d < 60 => "just now".to_string(),
+        d if d < 3600 => format!("{}m ago", d / 60),
+        d if d < 86_400 => format!("{}h ago", d / 3600),
+        d if d < 86_400 * 30 => format!("{}d ago", d / 86_400),
+        d if d < 86_400 * 365 => format!("{}mo ago", d / (86_400 * 30)),
+        d => format!("{}y ago", d / (86_400 * 365)),
     }
 }
 

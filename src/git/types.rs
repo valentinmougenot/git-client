@@ -29,6 +29,10 @@ pub enum GitCommand {
     DiscardAll,
     /// Persist the Staging Area as a new Commit with the given message.
     Commit(String),
+    /// Load the most recent Commits on the current branch, newest first.
+    LoadHistory,
+    /// Load one Commit's metadata and full Diff (against its first parent).
+    LoadCommitDetail(String),
     /// Push local Commits on the current branch to the Remote.
     Push,
     /// Pull Remote changes into the current branch.
@@ -49,6 +53,10 @@ pub enum GitEvent {
     DiffLoaded(Diff),
     /// A Commit was created; carries its short SHA.
     Committed(String),
+    /// The recent Commit history, newest first.
+    HistoryLoaded(Vec<CommitInfo>),
+    /// One Commit's metadata and full Diff.
+    CommitDetailLoaded(CommitDetail),
     /// A Push completed successfully.
     Pushed,
     /// A Pull completed successfully.
@@ -85,6 +93,33 @@ pub struct HeadInfo {
 pub struct CommitSummary {
     pub short_sha: String,
     pub summary: String,
+}
+
+/// One row in the History view: enough to list a Commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    /// The full SHA, used to request the detail.
+    pub sha: String,
+    pub short_sha: String,
+    pub summary: String,
+    pub author: String,
+    /// Commit time, Unix seconds (formatted relative to now in the UI).
+    pub time: i64,
+}
+
+/// A single Commit's metadata and full Diff, shown when one is selected in the
+/// History view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub sha: String,
+    pub short_sha: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    /// The full commit message (summary and body).
+    pub message: String,
+    /// The Diff against the first parent, with a header line per changed file.
+    pub lines: Vec<DiffLine>,
 }
 
 /// One entry in the File List: a path plus how it changed.

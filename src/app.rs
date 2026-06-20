@@ -13,7 +13,9 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Subscription, Task};
 
-use crate::git::{self, Diff, FileEntry, GitCommand, GitEvent, HeadInfo};
+use crate::git::{
+    self, CommitDetail, CommitInfo, Diff, FileEntry, GitCommand, GitEvent, HeadInfo,
+};
 use crate::ui;
 
 /// How long a success Notification stays on screen.
@@ -29,12 +31,25 @@ pub fn run() -> iced::Result {
         .run()
 }
 
+/// Which of the two left-column views is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// The working-tree changes: File List + Diff + Commit Panel.
+    #[default]
+    Changes,
+    /// The Commit history: the log list + the selected Commit's detail.
+    History,
+}
+
 /// The application root state.
 pub struct App {
     /// Channel to the Git Worker; `None` until the worker has booted.
     commands: Option<Sender<GitCommand>>,
     pub repo: RepoState,
     pub commit: CommitState,
+    pub history: HistoryState,
+    /// Which left-column view is active.
+    pub view: ViewMode,
     pub status: StatusBar,
     pub notification: Notification,
     /// Label of an in-progress remote operation (Push/Pull), if any.
@@ -44,6 +59,16 @@ pub struct App {
     pub checked: HashSet<Selection>,
     /// Whether Discard is armed, awaiting a confirming second press.
     pub discard_armed: bool,
+}
+
+/// The Commit history view's state: the loaded log, the selected Commit, and
+/// its loaded detail.
+#[derive(Default)]
+pub struct HistoryState {
+    pub commits: Vec<CommitInfo>,
+    /// The SHA of the selected Commit, whose detail is shown.
+    pub selected: Option<String>,
+    pub detail: Option<CommitDetail>,
 }
 
 /// Working Tree and Staging Area contents, the HEAD/branch context, the
@@ -123,6 +148,10 @@ pub enum UiMessage {
     DismissStatus,
     SelectNext,
     SelectPrevious,
+    /// Switch the left-column view (Changes / History).
+    ShowView(ViewMode),
+    /// Select a Commit in the History view and load its detail.
+    CommitSelected(String),
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +181,8 @@ impl App {
             commands: None,
             repo: RepoState::default(),
             commit: CommitState::default(),
+            history: HistoryState::default(),
+            view: ViewMode::default(),
             status: StatusBar::default(),
             notification: Notification::default(),
             operation: None,
@@ -184,7 +215,24 @@ impl App {
             UiMessage::DismissStatus => self.status.message = None,
             UiMessage::SelectNext => self.move_selection(1),
             UiMessage::SelectPrevious => self.move_selection(-1),
+            UiMessage::ShowView(view) => self.show_view(view),
+            UiMessage::CommitSelected(sha) => self.select_commit(sha),
         }
+    }
+
+    /// Switch the left-column view. Entering History (re)loads the log.
+    fn show_view(&mut self, view: ViewMode) {
+        self.view = view;
+        if view == ViewMode::History {
+            self.dispatch(GitCommand::LoadHistory);
+        }
+    }
+
+    /// Select a Commit and request its detail.
+    fn select_commit(&mut self, sha: String) {
+        self.history.selected = Some(sha.clone());
+        self.history.detail = None;
+        self.dispatch(GitCommand::LoadCommitDetail(sha));
     }
 
     fn update_git(&mut self, message: GitMessage) {
@@ -253,6 +301,10 @@ impl App {
                         path: selection.path.clone(),
                         staged: selection.staged,
                     });
+                }
+                // Keep the history fresh while it is on screen.
+                if self.view == ViewMode::History {
+                    self.dispatch(GitCommand::LoadHistory);
                 }
             }
             GitMessage::Commit => self.start_commit(),
@@ -327,10 +379,30 @@ impl App {
                     self.repo.diff = Some(diff);
                 }
             }
+            GitEvent::HistoryLoaded(commits) => {
+                self.history.commits = commits;
+                self.reconcile_commit_selection();
+                // Default to the newest Commit so the detail panel is never
+                // empty on entering the History view.
+                if self.history.selected.is_none()
+                    && let Some(first) = self.history.commits.first()
+                {
+                    self.select_commit(first.sha.clone());
+                }
+            }
+            GitEvent::CommitDetailLoaded(detail) => {
+                // Ignore a detail that no longer matches the selection (the user
+                // may have moved on before it arrived).
+                if self.history.selected.as_deref() == Some(detail.sha.as_str()) {
+                    self.history.detail = Some(detail);
+                }
+            }
             GitEvent::Committed(sha) => {
                 self.commit.committing = false;
                 self.commit.message.clear();
                 self.notify(format!("Committed {sha}"));
+                // A new Commit changes history; keep it current.
+                self.dispatch(GitCommand::LoadHistory);
             }
             GitEvent::Pushed => {
                 self.operation = None;
@@ -426,6 +498,20 @@ impl App {
         if self.repo.selected.is_some() && !still_present {
             self.repo.selected = None;
             self.repo.diff = None;
+        }
+    }
+
+    /// Drop the Commit selection and its detail if that Commit is no longer in
+    /// the loaded history (e.g. after an amend or a rebase elsewhere).
+    fn reconcile_commit_selection(&mut self) {
+        let still_present = self
+            .history
+            .selected
+            .as_ref()
+            .is_some_and(|sha| self.history.commits.iter().any(|c| &c.sha == sha));
+        if self.history.selected.is_some() && !still_present {
+            self.history.selected = None;
+            self.history.detail = None;
         }
     }
 
@@ -529,6 +615,8 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Named(Named::ArrowDown) => Message::Ui(UiMessage::SelectNext),
         Key::Named(Named::ArrowUp) => Message::Ui(UiMessage::SelectPrevious),
         Key::Named(Named::Escape) => Message::Ui(UiMessage::DismissStatus),
+        Key::Character("1") if command => Message::Ui(UiMessage::ShowView(ViewMode::Changes)),
+        Key::Character("2") if command => Message::Ui(UiMessage::ShowView(ViewMode::History)),
         Key::Named(Named::F5) => Message::Git(GitMessage::Refresh),
         Key::Character("r") if command => Message::Git(GitMessage::Refresh),
         Key::Named(Named::Enter) if command => Message::Git(GitMessage::Commit),

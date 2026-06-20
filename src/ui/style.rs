@@ -289,6 +289,30 @@ pub fn secondary(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// A view tab (Changes / History): the active one is accent-tinted and filled,
+/// inactive ones are quiet muted text that wash on hover.
+pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let (background, text_color) = if active {
+            (Some(Background::Color(ACCENT_SOFT)), ACCENT)
+        } else {
+            match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    (Some(Background::Color(BG_HOVER)), TEXT)
+                }
+                _ => (None, TEXT_MUTED),
+            }
+        };
+
+        button::Style {
+            background,
+            text_color,
+            border: radius(7.0),
+            ..button::Style::default()
+        }
+    }
+}
+
 /// The danger variant of [`secondary`], for Discard: the same pill shape, in red.
 pub fn secondary_danger(_theme: &Theme, status: button::Status) -> button::Style {
     let (background, border_color, text_color) = match status {

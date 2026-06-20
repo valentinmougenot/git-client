@@ -100,6 +100,14 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_status(repo, events);
         }
+        GitCommand::LoadHistory => match load_history(repo, HISTORY_LIMIT) {
+            Ok(commits) => events.emit(GitEvent::HistoryLoaded(commits)),
+            Err(error) => events.emit(GitEvent::Error(GitError::new("load history", &error))),
+        },
+        GitCommand::LoadCommitDetail(sha) => match load_commit_detail(repo, &sha) {
+            Ok(detail) => events.emit(GitEvent::CommitDetailLoaded(detail)),
+            Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
+        },
         GitCommand::Push => match push(repo) {
             Ok(()) => events.emit(GitEvent::Pushed),
             Err(error) => events.emit(GitEvent::Error(error)),
@@ -461,6 +469,101 @@ fn load_diff(repo: &Repository, path: &str, staged: bool) -> Result<Diff, git2::
     Ok(Diff {
         path: path.to_string(),
         staged,
+        lines,
+    })
+}
+
+/// How many recent Commits the History view loads.
+const HISTORY_LIMIT: usize = 200;
+
+/// Walk the Commit history from HEAD, newest first, up to `limit` entries.
+/// Returns an empty list when the branch is unborn (no commits yet).
+fn load_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, git2::Error> {
+    let mut walk = repo.revwalk()?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME)?;
+
+    let mut commits = Vec::new();
+    for oid in walk.take(limit) {
+        let oid = oid?;
+        let commit = repo.find_commit(oid)?;
+        commits.push(CommitInfo {
+            short_sha: short_sha(oid),
+            sha: oid.to_string(),
+            summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
+            author: commit.author().name().unwrap_or_default().to_string(),
+            time: commit.time().seconds(),
+        });
+    }
+    Ok(commits)
+}
+
+/// Load one Commit's metadata and its full Diff against its first parent (or
+/// against the empty tree for a root Commit). A header line is injected before
+/// each changed file so the combined patch reads clearly in the Diff View.
+fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2::Error> {
+    let oid = git2::Oid::from_str(sha)?;
+    let commit = repo.find_commit(oid)?;
+    let tree = commit.tree()?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+
+    let mut lines = Vec::new();
+    let mut last_path: Option<String> = None;
+    diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+        let kind = match line.origin() {
+            '+' => DiffLineKind::Addition,
+            '-' => DiffLineKind::Deletion,
+            ' ' => DiffLineKind::Context,
+            'H' => DiffLineKind::Header,
+            // Skip libgit2's own file headers, binary markers, etc.
+            _ => return true,
+        };
+
+        // Inject our own header line whenever the file changes.
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|path| path.to_string_lossy().to_string());
+        if path != last_path {
+            if let Some(path) = &path {
+                lines.push(DiffLine {
+                    kind: DiffLineKind::Header,
+                    old_lineno: None,
+                    new_lineno: None,
+                    content: format!("● {path}"),
+                });
+            }
+            last_path = path;
+        }
+
+        let content = String::from_utf8_lossy(line.content())
+            .trim_end_matches('\n')
+            .to_string();
+        lines.push(DiffLine {
+            kind,
+            old_lineno: line.old_lineno(),
+            new_lineno: line.new_lineno(),
+            content,
+        });
+        true
+    })?;
+
+    let author = commit.author();
+    Ok(CommitDetail {
+        short_sha: short_sha(oid),
+        sha: oid.to_string(),
+        author: author.name().unwrap_or_default().to_string(),
+        email: author.email().unwrap_or_default().to_string(),
+        time: commit.time().seconds(),
+        message: commit.message().unwrap_or_default().to_string(),
         lines,
     })
 }
