@@ -91,11 +91,13 @@ pub struct Selection {
     pub staged: bool,
 }
 
-/// In-progress commit message and whether a Commit is running.
+/// In-progress commit message, whether a Commit is running, and whether the
+/// next Commit amends HEAD instead of creating a new Commit.
 #[derive(Default)]
 pub struct CommitState {
     pub message: String,
     pub committing: bool,
+    pub amend: bool,
 }
 
 /// The last error or warning; sticky until dismissed.
@@ -145,6 +147,8 @@ pub enum UiMessage {
         staged: bool,
     },
     CommitMessageChanged(String),
+    /// Toggle whether the next Commit amends HEAD.
+    ToggleAmend,
     DismissStatus,
     SelectNext,
     SelectPrevious,
@@ -212,6 +216,7 @@ impl App {
             }
             UiMessage::ToggleSection { staged } => self.toggle_section(staged),
             UiMessage::CommitMessageChanged(value) => self.commit.message = value,
+            UiMessage::ToggleAmend => self.toggle_amend(),
             UiMessage::DismissStatus => self.status.message = None,
             UiMessage::SelectNext => self.move_selection(1),
             UiMessage::SelectPrevious => self.move_selection(-1),
@@ -400,8 +405,9 @@ impl App {
             GitEvent::Committed(sha) => {
                 self.commit.committing = false;
                 self.commit.message.clear();
+                self.commit.amend = false;
                 self.notify(format!("Committed {sha}"));
-                // A new Commit changes history; keep it current.
+                // A new (or amended) Commit changes history; keep it current.
                 self.dispatch(GitCommand::LoadHistory);
             }
             GitEvent::Pushed => {
@@ -465,12 +471,37 @@ impl App {
         self.select(selection.path, selection.staged);
     }
 
+    /// Flip the amend toggle. Turning it on with an empty field prefills the
+    /// message with the last Commit's summary, the usual starting point.
+    fn toggle_amend(&mut self) {
+        self.commit.amend = !self.commit.amend;
+        if self.commit.amend
+            && self.commit.message.trim().is_empty()
+            && let Some(commit) = &self.repo.head.last_commit
+        {
+            self.commit.message = commit.summary.clone();
+        }
+    }
+
     fn start_commit(&mut self) {
         let message = self.commit.message.trim().to_string();
         if message.is_empty() {
             self.status.message = Some("Cannot commit: the message is empty".to_string());
             return;
         }
+
+        // Amend replaces HEAD, so it needs a Commit to amend but not staged
+        // changes (amending only the message is valid).
+        if self.commit.amend {
+            if self.repo.head.last_commit.is_none() {
+                self.status.message = Some("Cannot amend: there is no commit yet".to_string());
+                return;
+            }
+            self.commit.committing = true;
+            self.dispatch(GitCommand::Amend(message));
+            return;
+        }
+
         if self.repo.staged.is_empty() {
             self.status.message = Some("Cannot commit: nothing is staged".to_string());
             return;
@@ -912,6 +943,38 @@ mod tests {
         let mut app = App::new();
         app.repo.staged = vec![entry("a.txt", ChangeKind::Added)];
         app.commit.message = "   ".to_string();
+
+        update(&mut app, Message::Git(GitMessage::Commit));
+
+        assert!(!app.commit.committing);
+        assert!(app.status.message.is_some());
+    }
+
+    #[test]
+    fn amend_toggle_prefills_message_and_commits_without_staging() {
+        let mut app = App::new();
+        app.repo.head.last_commit = Some(crate::git::CommitSummary {
+            short_sha: "abc1234".to_string(),
+            summary: "previous message".to_string(),
+        });
+
+        // Toggling amend on prefills the empty field with the last summary.
+        update(&mut app, Message::Ui(UiMessage::ToggleAmend));
+        assert!(app.commit.amend);
+        assert_eq!(app.commit.message, "previous message");
+
+        // Amend proceeds with nothing staged (only the message need change).
+        assert!(app.repo.staged.is_empty());
+        update(&mut app, Message::Git(GitMessage::Commit));
+        assert!(app.commit.committing);
+        assert!(app.status.message.is_none());
+    }
+
+    #[test]
+    fn amend_is_rejected_when_there_is_no_commit_yet() {
+        let mut app = App::new();
+        app.commit.amend = true;
+        app.commit.message = "anything".to_string();
 
         update(&mut app, Message::Git(GitMessage::Commit));
 

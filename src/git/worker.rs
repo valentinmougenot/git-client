@@ -100,6 +100,13 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_status(repo, events);
         }
+        GitCommand::Amend(message) => {
+            match amend(repo, &message) {
+                Ok(sha) => events.emit(GitEvent::Committed(sha)),
+                Err(error) => events.emit(GitEvent::Error(GitError::new("amend", &error))),
+            }
+            emit_status(repo, events);
+        }
         GitCommand::LoadHistory => match load_history(repo, HISTORY_LIMIT) {
             Ok(commits) => events.emit(GitEvent::HistoryLoaded(commits)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load history", &error))),
@@ -412,6 +419,25 @@ fn commit(repo: &Repository, message: &str) -> Result<String, git2::Error> {
         &parent_refs,
     )?;
 
+    Ok(short_sha(oid))
+}
+
+/// Replace the HEAD Commit with one carrying the current Staging Area as its
+/// tree and a new message, keeping the original parents (`git commit --amend`).
+fn amend(repo: &Repository, message: &str) -> Result<String, git2::Error> {
+    let head = repo.head()?.peel_to_commit()?;
+    let mut index = repo.index()?;
+    let tree = repo.find_tree(index.write_tree()?)?;
+    let signature = repo.signature()?;
+
+    let oid = head.amend(
+        Some("HEAD"),
+        Some(&signature),
+        Some(&signature),
+        None,
+        Some(message),
+        Some(&tree),
+    )?;
     Ok(short_sha(oid))
 }
 
@@ -853,6 +879,32 @@ mod tests {
         assert!(staged.is_empty());
         // The commit is really in history.
         assert!(repo.head().unwrap().peel_to_commit().is_ok());
+    }
+
+    #[test]
+    fn amend_replaces_the_last_commit() {
+        let (dir, repo) = temp_repo();
+        write(dir.path(), "a.txt", "one\n");
+        let events = Collector::default();
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Commit("original".into()), &events);
+        let original = repo.head().unwrap().peel_to_commit().unwrap().id();
+
+        // Stage a further change and amend with a new message.
+        write(dir.path(), "a.txt", "one\ntwo\n");
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Amend("amended".into()), &events);
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().ok().flatten(), Some("amended"));
+        // HEAD was replaced, not added to, and the new tree includes the change.
+        assert_ne!(head.id(), original);
+        assert_eq!(head.parent_count(), 0);
+
+        // History still holds exactly one commit.
+        let history = load_history(&repo, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].summary, "amended");
     }
 
     #[test]

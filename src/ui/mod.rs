@@ -645,10 +645,12 @@ fn lineno(value: Option<u32>) -> String {
 
 // ── Commit Panel ─────────────────────────────────────────────────────────
 
-/// The bottom-right Commit Panel: message field, Commit button, and a hint.
+/// The bottom-right Commit Panel: message field, an Amend toggle, the Commit
+/// button, and a summary of what will be committed.
 fn commit_panel(app: &App) -> Element<'_, Message> {
     let commit = &app.commit;
     let staged = app.repo.staged.len();
+    let has_commit = app.repo.head.last_commit.is_some();
 
     let input = text_input("Commit message", &commit.message)
         .on_input(|value| Message::Ui(UiMessage::CommitMessageChanged(value)))
@@ -657,25 +659,47 @@ fn commit_panel(app: &App) -> Element<'_, Message> {
         .size(14)
         .style(style::input);
 
+    // Amend replaces HEAD: it needs an existing Commit but not staged changes.
+    // A plain Commit needs something staged.
     let label = if commit.committing {
         "Committing…"
+    } else if commit.amend {
+        "Amend"
     } else {
         "Commit"
     };
-    // The Commit can only fire with a non-empty message, something staged, and
-    // no commit already running — mirror that in the button's enabled state.
-    let ready = !commit.committing && !commit.message.trim().is_empty() && staged > 0;
+    let ready = !commit.committing
+        && !commit.message.trim().is_empty()
+        && if commit.amend { has_commit } else { staged > 0 };
     let commit_button = button(text(label).size(14))
         .on_press_maybe(ready.then_some(Message::Git(GitMessage::Commit)))
         .padding([8, 18])
         .style(style::primary);
 
-    let summary = match staged {
-        0 => "Nothing staged".to_string(),
-        1 => "1 file staged".to_string(),
-        n => format!("{n} files staged"),
+    // The Amend toggle is only meaningful once there is a Commit to amend.
+    let amend_toggle = checkbox(commit.amend)
+        .on_toggle_maybe(has_commit.then_some(|_| Message::Ui(UiMessage::ToggleAmend)))
+        .size(16)
+        .style(style::check);
+    let amend_color = if commit.amend {
+        style::ACCENT
+    } else {
+        style::TEXT_MUTED
     };
-    let summary_color = if staged > 0 {
+    let amend = row![amend_toggle, text("Amend").size(12).color(amend_color)]
+        .spacing(8)
+        .align_y(Center);
+
+    let summary = if commit.amend {
+        "Replaces the last commit".to_string()
+    } else {
+        match staged {
+            0 => "Nothing staged".to_string(),
+            1 => "1 file staged".to_string(),
+            n => format!("{n} files staged"),
+        }
+    };
+    let summary_color = if commit.amend || staged > 0 {
         style::GREEN
     } else {
         style::TEXT_FAINT
@@ -683,6 +707,7 @@ fn commit_panel(app: &App) -> Element<'_, Message> {
 
     let footer = row![
         commit_button,
+        amend,
         text(summary).size(12).color(summary_color),
         space::horizontal(),
         text("Ctrl+Enter").size(11).color(style::TEXT_FAINT),

@@ -29,6 +29,9 @@ pub enum GitCommand {
     DiscardAll,
     /// Persist the Staging Area as a new Commit with the given message.
     Commit(String),
+    /// Replace the HEAD Commit, reusing the Staging Area as its tree and the
+    /// given message (a `git commit --amend`).
+    Amend(String),
     /// Load the most recent Commits on the current branch, newest first.
     LoadHistory,
     /// Load one Commit's metadata and full Diff (against its first parent).
