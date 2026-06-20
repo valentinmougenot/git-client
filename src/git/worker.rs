@@ -134,6 +134,30 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(detail) => events.emit(GitEvent::CommitDetailLoaded(detail)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
         },
+        GitCommand::LoadBranches => emit_branches(repo, events),
+        GitCommand::Checkout(name) => {
+            match checkout_branch(repo, &name) {
+                Ok(()) => events.emit(GitEvent::CheckedOut(name)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
+        GitCommand::CreateBranch(name) => {
+            match create_branch(repo, &name) {
+                Ok(()) => events.emit(GitEvent::CheckedOut(name)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
+        GitCommand::DeleteBranch(name) => {
+            match delete_branch(repo, &name) {
+                Ok(()) => events.emit(GitEvent::BranchDeleted(name)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_branches(repo, events);
+        }
         GitCommand::Push => match push(repo) {
             Ok(()) => events.emit(GitEvent::Pushed),
             Err(error) => events.emit(GitEvent::Error(error)),
@@ -729,6 +753,80 @@ fn pull(repo: &Repository) -> Result<(), GitError> {
         .map_err(|error| GitError::new("checkout", &error))
 }
 
+/// Read the local branches and emit them, or surface the failure.
+fn emit_branches(repo: &Repository, events: &impl EventSink) {
+    match load_branches(repo) {
+        Ok(branches) => events.emit(GitEvent::BranchesLoaded(branches)),
+        Err(error) => events.emit(GitEvent::Error(GitError::new("load branches", &error))),
+    }
+}
+
+/// List the local branches, sorted with the current branch first, then by name.
+fn load_branches(repo: &Repository) -> Result<Vec<BranchInfo>, git2::Error> {
+    let mut branches = Vec::new();
+    for entry in repo.branches(Some(git2::BranchType::Local))? {
+        let (branch, _) = entry?;
+        let Some(name) = branch.name()?.map(str::to_string) else {
+            continue;
+        };
+        let is_head = branch.is_head();
+        let (upstream, ahead, behind) = upstream_divergence(repo, Some(&name));
+        branches.push(BranchInfo {
+            name,
+            is_head,
+            upstream,
+            ahead,
+            behind,
+        });
+    }
+    branches.sort_by(|a, b| b.is_head.cmp(&a.is_head).then_with(|| a.name.cmp(&b.name)));
+    Ok(branches)
+}
+
+/// Switch HEAD and the Working Tree to an existing local branch. The checkout is
+/// safe: libgit2 refuses it (and we surface the error) if it would overwrite
+/// uncommitted local changes.
+fn checkout_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
+    let refname = format!("refs/heads/{name}");
+    let object = repo
+        .revparse_single(&refname)
+        .map_err(|error| GitError::new("find branch", &error))?;
+
+    repo.checkout_tree(&object, None)
+        .map_err(|error| GitError::new("checkout", &error))?;
+    repo.set_head(&refname)
+        .map_err(|error| GitError::new("update HEAD", &error))?;
+    Ok(())
+}
+
+/// Create a new local branch at HEAD and switch to it. Fails if the branch
+/// already exists or there is no commit yet to branch from.
+fn create_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
+    let head = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|error| GitError::new("resolve HEAD", &error))?;
+    repo.branch(name, &head, false)
+        .map_err(|error| GitError::new("create branch", &error))?;
+    checkout_branch(repo, name)
+}
+
+/// Delete a local branch. Refuses to delete the branch currently checked out.
+fn delete_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
+    let mut branch = repo
+        .find_branch(name, git2::BranchType::Local)
+        .map_err(|error| GitError::new("find branch", &error))?;
+    if branch.is_head() {
+        return Err(GitError::custom(
+            "delete branch",
+            "cannot delete the current branch",
+        ));
+    }
+    branch
+        .delete()
+        .map_err(|error| GitError::new("delete branch", &error))
+}
+
 /// The short name of the currently checked-out branch.
 fn current_branch(repo: &Repository) -> Result<String, GitError> {
     let head = repo
@@ -822,6 +920,26 @@ mod tests {
                 })
                 .expect("expected a StatusLoaded event")
         }
+
+        /// The branch list from the most recent `BranchesLoaded`.
+        fn last_branches(&self) -> Vec<BranchInfo> {
+            self.0
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    GitEvent::BranchesLoaded(branches) => Some(branches.clone()),
+                    _ => None,
+                })
+                .expect("expected a BranchesLoaded event")
+        }
+    }
+
+    /// Commit a single file, so tests have a HEAD to branch from.
+    fn commit_file(dir: &Path, repo: &Repository, events: &Collector, name: &str, contents: &str) {
+        write(dir, name, contents);
+        process(repo, GitCommand::StageFile(name.into()), events);
+        process(repo, GitCommand::Commit(format!("add {name}")), events);
     }
 
     /// A fresh repository in a temp dir, with a commit identity configured.
@@ -1223,5 +1341,98 @@ mod tests {
         let (_unstaged, staged) = events.last_status();
         assert_eq!(paths(&staged), ["gone.txt"]);
         assert_eq!(staged[0].change, ChangeKind::Deleted);
+    }
+
+    #[test]
+    fn load_branches_lists_locals_with_the_current_first() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let current = events.last_head().branch.expect("a branch");
+
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        // CreateBranch switches to feature; switch back so `current` is head.
+        process(&repo, GitCommand::Checkout(current.clone()), &events);
+        process(&repo, GitCommand::LoadBranches, &events);
+
+        let branches = events.last_branches();
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"feature"));
+        assert!(names.contains(&current.as_str()));
+        // The current branch sorts first and is the only one marked head.
+        assert!(branches[0].is_head);
+        assert_eq!(branches.iter().filter(|b| b.is_head).count(), 1);
+    }
+
+    #[test]
+    fn create_branch_switches_to_the_new_branch() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+
+        assert_eq!(events.last_head().branch.as_deref(), Some("feature"));
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::CheckedOut(name) if name == "feature"))
+        );
+    }
+
+    #[test]
+    fn checkout_switches_between_existing_branches() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let original = events.last_head().branch.expect("a branch");
+
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        assert_eq!(events.last_head().branch.as_deref(), Some("feature"));
+
+        process(&repo, GitCommand::Checkout(original.clone()), &events);
+        assert_eq!(events.last_head().branch, Some(original));
+    }
+
+    #[test]
+    fn delete_branch_removes_a_non_current_branch() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let original = events.last_head().branch.expect("a branch");
+
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        process(&repo, GitCommand::Checkout(original), &events);
+        process(&repo, GitCommand::DeleteBranch("feature".into()), &events);
+
+        let names: Vec<String> = events.last_branches().into_iter().map(|b| b.name).collect();
+        assert!(!names.contains(&"feature".to_string()));
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::BranchDeleted(name) if name == "feature"))
+        );
+    }
+
+    #[test]
+    fn deleting_the_current_branch_is_refused() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let current = events.last_head().branch.expect("a branch");
+
+        process(&repo, GitCommand::DeleteBranch(current.clone()), &events);
+
+        // The branch survives and an error was surfaced.
+        let names: Vec<String> = events.last_branches().into_iter().map(|b| b.name).collect();
+        assert!(names.contains(&current));
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::Error(_)))
+        );
     }
 }

@@ -17,7 +17,9 @@ use iced::widget::{
 use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
-use crate::git::{ChangeKind, CommitInfo, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo};
+use crate::git::{
+    BranchInfo, ChangeKind, CommitInfo, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo,
+};
 
 /// The application's custom dark [`iced::Theme`].
 pub fn theme() -> iced::Theme {
@@ -30,6 +32,7 @@ pub fn root(app: &App) -> Element<'_, Message> {
     let left_body = match app.view {
         ViewMode::Changes => file_list(app),
         ViewMode::History => history_list(&app.history),
+        ViewMode::Branches => branches_list(app),
     };
     let left = container(column![view_tabs(app), left_body])
         .style(style::panel)
@@ -50,6 +53,11 @@ pub fn root(app: &App) -> Element<'_, Message> {
                 .into()
         }
         ViewMode::History => container(commit_detail_view(&app.history))
+            .style(style::panel)
+            .width(Length::FillPortion(3))
+            .height(Fill)
+            .into(),
+        ViewMode::Branches => container(branches_detail(app))
             .style(style::panel)
             .width(Length::FillPortion(3))
             .height(Fill)
@@ -80,6 +88,7 @@ fn view_tabs(app: &App) -> Element<'_, Message> {
     let tabs = row![
         tab(&changes_label, ViewMode::Changes, app.view),
         tab("History", ViewMode::History, app.view),
+        tab("Branches", ViewMode::Branches, app.view),
     ]
     .spacing(4);
 
@@ -658,6 +667,136 @@ impl canvas::Program<Message> for GraphCell {
 /// The color for a graph lane, cycling through the lane palette.
 fn lane_color(index: usize) -> iced::Color {
     style::LANE_COLORS[index % style::LANE_COLORS.len()]
+}
+
+// ── Branches ─────────────────────────────────────────────────────────────
+
+/// The left column in the Branches view: a new-branch creator, then the local
+/// branches with the current one marked.
+fn branches_list(app: &App) -> Element<'_, Message> {
+    let mut items: Vec<Element<Message>> = Vec::new();
+
+    let can_create = !app.branches.new_name.trim().is_empty();
+    let input = text_input("New branch name", &app.branches.new_name)
+        .on_input(|value| Message::Ui(UiMessage::NewBranchNameChanged(value)))
+        .on_submit(Message::Git(GitMessage::CreateBranch))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let create = pill("+", 15, "Create", GitMessage::CreateBranch, Tone::Normal, can_create);
+    items.push(row![input, create].spacing(6).align_y(Center).into());
+
+    items.push(gap(8.0));
+    items.push(
+        text(format!("LOCAL ({})", app.branches.branches.len()))
+            .size(11)
+            .color(style::TEXT_MUTED)
+            .into(),
+    );
+
+    if app.branches.branches.is_empty() {
+        items.push(placeholder("No branches yet"));
+    } else {
+        let armed = app.branches.delete_armed.as_deref();
+        for branch in &app.branches.branches {
+            items.push(branch_row(branch, armed == Some(branch.name.as_str())));
+        }
+    }
+
+    scrollable(column(items).spacing(4).padding(12))
+        .height(Fill)
+        .into()
+}
+
+/// One branch: a current-branch marker, its name, its sync state, and — for any
+/// branch other than the current one — a click target to switch to it and a
+/// delete button.
+fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
+    let bar = container(text(""))
+        .width(Length::Fixed(3.0))
+        .height(Length::Fixed(16.0))
+        .style(style::selection_bar(branch.is_head));
+
+    let icon_color = if branch.is_head {
+        style::ACCENT
+    } else {
+        style::TEXT_FAINT
+    };
+    let name_color = if branch.is_head {
+        style::TEXT
+    } else {
+        style::TEXT_MUTED
+    };
+
+    let mut label = row![
+        bar,
+        text("⎇").size(13).color(icon_color),
+        text(branch.name.clone()).size(14).color(name_color),
+    ]
+    .spacing(10)
+    .align_y(Center);
+
+    if branch.ahead > 0 {
+        label = label.push(text(format!("↑{}", branch.ahead)).size(11).color(style::GREEN));
+    }
+    if branch.behind > 0 {
+        label = label.push(text(format!("↓{}", branch.behind)).size(11).color(style::YELLOW));
+    }
+    if branch.upstream.is_none() {
+        label = label.push(text("local").size(10).color(style::TEXT_FAINT));
+    }
+
+    // The current branch is shown highlighted but is not a switch target.
+    let select = button(label)
+        .on_press_maybe(
+            (!branch.is_head).then(|| Message::Git(GitMessage::Checkout(branch.name.clone()))),
+        )
+        .width(Fill)
+        .padding([6, 8])
+        .style(style::file_item(branch.is_head));
+
+    let mut layout = row![select].spacing(6).align_y(Center);
+    if !branch.is_head {
+        let label = if armed { "Confirm?" } else { "" };
+        layout = layout.push(pill(
+            "✕",
+            13,
+            label,
+            GitMessage::DeleteBranch(branch.name.clone()),
+            Tone::Danger,
+            true,
+        ));
+    }
+    layout.into()
+}
+
+/// The right panel in the Branches view: a short summary of the current branch
+/// and a hint on how to use the list.
+fn branches_detail(app: &App) -> Element<'_, Message> {
+    let head = &app.repo.head;
+    let title = match &head.branch {
+        Some(branch) => format!("On branch {branch}"),
+        None => "Detached HEAD".to_string(),
+    };
+
+    let mut lines = column![text(title).size(16).color(style::TEXT)].spacing(8);
+    if let Some(upstream) = &head.upstream {
+        lines = lines.push(
+            text(format!("Tracking {upstream}"))
+                .size(13)
+                .color(style::TEXT_MUTED),
+        );
+    }
+    lines = lines.push(
+        text("Click a branch to switch to it · ✕ to delete · Create above")
+            .size(12)
+            .color(style::TEXT_FAINT),
+    );
+
+    container(lines.align_x(Center))
+        .center(Fill)
+        .padding(12)
+        .into()
 }
 
 // ── Commit Detail ────────────────────────────────────────────────────────

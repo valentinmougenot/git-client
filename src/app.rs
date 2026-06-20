@@ -14,7 +14,7 @@ use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Subscription, Task};
 
 use crate::git::{
-    self, CommitDetail, CommitInfo, Diff, FileEntry, GitCommand, GitEvent, HeadInfo,
+    self, BranchInfo, CommitDetail, CommitInfo, Diff, FileEntry, GitCommand, GitEvent, HeadInfo,
 };
 use crate::ui;
 
@@ -31,7 +31,7 @@ pub fn run() -> iced::Result {
         .run()
 }
 
-/// Which of the two left-column views is showing.
+/// Which left-column view is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     /// The working-tree changes: File List + Diff + Commit Panel.
@@ -39,6 +39,8 @@ pub enum ViewMode {
     Changes,
     /// The Commit history: the log list + the selected Commit's detail.
     History,
+    /// The local branches: list, switch, create, and delete.
+    Branches,
 }
 
 /// The application root state.
@@ -48,6 +50,7 @@ pub struct App {
     pub repo: RepoState,
     pub commit: CommitState,
     pub history: HistoryState,
+    pub branches: BranchesState,
     /// Which left-column view is active.
     pub view: ViewMode,
     pub status: StatusBar,
@@ -72,6 +75,16 @@ pub struct HistoryState {
     /// The SHA of the selected Commit, whose detail is shown.
     pub selected: Option<String>,
     pub detail: Option<CommitDetail>,
+}
+
+/// The Branches view's state: the loaded branches, the in-progress new-branch
+/// name, and which branch (if any) is armed for a confirming delete.
+#[derive(Default)]
+pub struct BranchesState {
+    pub branches: Vec<BranchInfo>,
+    pub new_name: String,
+    /// The branch awaiting a confirming second Delete press, if any.
+    pub delete_armed: Option<String>,
 }
 
 /// Working Tree and Staging Area contents, the HEAD/branch context, the
@@ -176,6 +189,8 @@ pub enum UiMessage {
     ShowView(ViewMode),
     /// Select a Commit in the History view and load its detail.
     CommitSelected(String),
+    /// The new-branch name field changed.
+    NewBranchNameChanged(String),
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +214,13 @@ pub enum GitMessage {
     /// the app) and reload the active Diff.
     Refresh,
     Commit,
+    /// Switch to the named local branch.
+    Checkout(String),
+    /// Create a local branch from the in-progress name and switch to it.
+    CreateBranch,
+    /// Delete the named branch. First press arms a confirmation; the second
+    /// performs it.
+    DeleteBranch(String),
     Push,
     Pull,
 }
@@ -210,6 +232,7 @@ impl App {
             repo: RepoState::default(),
             commit: CommitState::default(),
             history: HistoryState::default(),
+            branches: BranchesState::default(),
             view: ViewMode::default(),
             status: StatusBar::default(),
             notification: Notification::default(),
@@ -234,8 +257,10 @@ impl App {
     }
 
     fn update_ui(&mut self, message: UiMessage) {
-        // Interacting elsewhere cancels a pending Discard confirmation.
+        // Interacting elsewhere cancels a pending Discard or branch-delete
+        // confirmation.
         self.discard_armed = false;
+        self.branches.delete_armed = None;
 
         match message {
             UiMessage::FileSelected { path, staged } => self.select(path, staged),
@@ -260,14 +285,17 @@ impl App {
             UiMessage::SelectPrevious => self.move_selection(-1),
             UiMessage::ShowView(view) => self.show_view(view),
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
+            UiMessage::NewBranchNameChanged(name) => self.branches.new_name = name,
         }
     }
 
-    /// Switch the left-column view. Entering History (re)loads the log.
+    /// Switch the left-column view, (re)loading the data that view needs.
     fn show_view(&mut self, view: ViewMode) {
         self.view = view;
-        if view == ViewMode::History {
-            self.dispatch(GitCommand::LoadHistory);
+        match view {
+            ViewMode::History => self.dispatch(GitCommand::LoadHistory),
+            ViewMode::Branches => self.dispatch(GitCommand::LoadBranches),
+            ViewMode::Changes => {}
         }
     }
 
@@ -283,6 +311,11 @@ impl App {
         // confirmation.
         if !matches!(message, GitMessage::DiscardChecked) {
             self.discard_armed = false;
+        }
+        // Likewise, anything but pressing Delete again cancels an armed branch
+        // deletion.
+        if !matches!(message, GitMessage::DeleteBranch(_)) {
+            self.branches.delete_armed = None;
         }
 
         match message {
@@ -357,6 +390,22 @@ impl App {
                 self.dispatch(GitCommand::UnstageHunk { path, hunk });
             }
             GitMessage::Commit => self.start_commit(),
+            GitMessage::Checkout(name) => self.dispatch(GitCommand::Checkout(name)),
+            GitMessage::CreateBranch => {
+                let name = self.branches.new_name.trim().to_string();
+                if !name.is_empty() {
+                    self.dispatch(GitCommand::CreateBranch(name));
+                }
+            }
+            GitMessage::DeleteBranch(name) => {
+                // First press arms this branch; the confirming second deletes it.
+                if self.branches.delete_armed.as_deref() == Some(name.as_str()) {
+                    self.branches.delete_armed = None;
+                    self.dispatch(GitCommand::DeleteBranch(name));
+                } else {
+                    self.branches.delete_armed = Some(name);
+                }
+            }
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
         }
@@ -474,6 +523,22 @@ impl App {
                 self.notify(format!("Committed {sha}"));
                 // A new (or amended) Commit changes history; keep it current.
                 self.dispatch(GitCommand::LoadHistory);
+            }
+            GitEvent::BranchesLoaded(branches) => {
+                self.branches.branches = branches;
+            }
+            GitEvent::CheckedOut(name) => {
+                self.notify(format!("Switched to {name}"));
+                self.branches.new_name.clear();
+                self.branches.delete_armed = None;
+                // The new branch has its own history; refresh if it is showing.
+                if self.view == ViewMode::History {
+                    self.dispatch(GitCommand::LoadHistory);
+                }
+            }
+            GitEvent::BranchDeleted(name) => {
+                self.notify(format!("Deleted {name}"));
+                self.branches.delete_armed = None;
             }
             GitEvent::Pushed => {
                 self.operation = None;
@@ -713,6 +778,7 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Named(Named::Escape) => Message::Ui(UiMessage::DismissStatus),
         Key::Character("1") if command => Message::Ui(UiMessage::ShowView(ViewMode::Changes)),
         Key::Character("2") if command => Message::Ui(UiMessage::ShowView(ViewMode::History)),
+        Key::Character("3") if command => Message::Ui(UiMessage::ShowView(ViewMode::Branches)),
         Key::Named(Named::F5) => Message::Git(GitMessage::Refresh),
         Key::Character("r") if command => Message::Git(GitMessage::Refresh),
         Key::Named(Named::Enter) if command => Message::Git(GitMessage::Commit),

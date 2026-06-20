@@ -42,6 +42,14 @@ pub enum GitCommand {
     LoadHistory,
     /// Load one Commit's metadata and full Diff (against its first parent).
     LoadCommitDetail(String),
+    /// Load the local branches and their sync state.
+    LoadBranches,
+    /// Switch the Working Tree and HEAD to the named local branch.
+    Checkout(String),
+    /// Create a new local branch at HEAD and switch to it.
+    CreateBranch(String),
+    /// Delete the named local branch (never the current one).
+    DeleteBranch(String),
     /// Push local Commits on the current branch to the Remote.
     Push,
     /// Pull Remote changes into the current branch.
@@ -66,6 +74,12 @@ pub enum GitEvent {
     HistoryLoaded(Vec<CommitInfo>),
     /// One Commit's metadata and full Diff.
     CommitDetailLoaded(CommitDetail),
+    /// The local branches and their sync state.
+    BranchesLoaded(Vec<BranchInfo>),
+    /// A branch was checked out (or created and checked out); carries its name.
+    CheckedOut(String),
+    /// A branch was deleted; carries its name.
+    BranchDeleted(String),
     /// A Push completed successfully.
     Pushed,
     /// A Pull completed successfully.
@@ -102,6 +116,21 @@ pub struct HeadInfo {
 pub struct CommitSummary {
     pub short_sha: String,
     pub summary: String,
+}
+
+/// One local branch in the Branches view: its name, whether it is checked out,
+/// and how it sits relative to its upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+    pub name: String,
+    /// This branch is the currently checked-out HEAD.
+    pub is_head: bool,
+    /// The configured upstream tracking branch, if any.
+    pub upstream: Option<String>,
+    /// Commits ahead of the upstream.
+    pub ahead: usize,
+    /// Commits behind the upstream.
+    pub behind: usize,
 }
 
 /// One row in the History view: enough to list a Commit.
