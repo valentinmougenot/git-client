@@ -8,48 +8,56 @@ use iced::widget::{button, checkbox, container, text_input};
 use iced::{Background, Border, Color, Theme};
 
 // ── Palette ──────────────────────────────────────────────────────────────
-// A deep, near-black dark scale: layered surfaces, muted text, one indigo
-// accent, and the semantic colors (add / remove / info / untracked).
+// The "Tokyo Night" scale: a deep, near-black base with a faint blue cast, a
+// soft blue accent, and gentle semantic colors (add / remove / info / warn).
+//
+// IMPORTANT: iced's `Color::from_rgb` here is treated as *linear* light and
+// gamma-encoded to sRGB at display time — so a literal like 0.05 renders much
+// lighter than #0d0d0d. Every value below is therefore the LINEAR form of the
+// sRGB hex named in its doc comment. To change a color, edit the hex and
+// re-derive each channel `c` (0..1) with the standard sRGB→linear transfer:
+//   c <= 0.04045 ? c/12.92 : ((c + 0.055)/1.055).powf(2.4)
+// Don't hand-tweak the floats directly.
 
-/// The window background, behind every panel.
-pub const BG_APP: Color = Color::from_rgb(0.031, 0.035, 0.047);
-/// A raised panel surface (File List, Diff View, Commit Panel).
-pub const BG_PANEL: Color = Color::from_rgb(0.055, 0.063, 0.078);
-/// An inset surface (inputs, action buttons).
-pub const BG_ELEVATED: Color = Color::from_rgb(0.086, 0.098, 0.133);
-/// The hover wash on list rows.
-pub const BG_HOVER: Color = Color::from_rgb(0.114, 0.129, 0.169);
-/// Hairline borders and dividers.
-pub const BORDER: Color = Color::from_rgb(0.149, 0.169, 0.208);
+/// The window background, behind every panel (sRGB `#08090d`).
+pub const BG_APP: Color = Color::from_rgb(0.00243, 0.00273, 0.00402);
+/// A raised panel surface — File List, Diff View, Commit Panel (sRGB `#0e1019`).
+pub const BG_PANEL: Color = Color::from_rgb(0.00439, 0.00518, 0.00972);
+/// An inset surface — inputs, action buttons, headers (sRGB `#171a27`).
+pub const BG_ELEVATED: Color = Color::from_rgb(0.00857, 0.01033, 0.02029);
+/// The hover wash on list rows (sRGB `#1f2336`).
+pub const BG_HOVER: Color = Color::from_rgb(0.01370, 0.01681, 0.03689);
+/// Hairline borders and dividers (sRGB `#2a2f44`).
+pub const BORDER: Color = Color::from_rgb(0.02315, 0.02843, 0.05781);
 
-/// Primary text.
-pub const TEXT: Color = Color::from_rgb(0.902, 0.929, 0.953);
-/// Secondary text (labels, context lines).
-pub const TEXT_MUTED: Color = Color::from_rgb(0.545, 0.580, 0.620);
-/// Tertiary text (gutters, hints).
-pub const TEXT_FAINT: Color = Color::from_rgb(0.431, 0.463, 0.506);
+/// Primary text (sRGB `#c0caf5`).
+pub const TEXT: Color = Color::from_rgb(0.52712, 0.59062, 0.91310);
+/// Secondary text — labels, context lines (sRGB `#828bb8`).
+pub const TEXT_MUTED: Color = Color::from_rgb(0.22323, 0.25818, 0.47932);
+/// Tertiary text — gutters, hints (sRGB `#565f89`).
+pub const TEXT_FAINT: Color = Color::from_rgb(0.09306, 0.11444, 0.25016);
 
-/// The single accent, used for selection and primary actions.
-pub const ACCENT: Color = Color::from_rgb(0.431, 0.482, 0.949);
-const ACCENT_HOVER: Color = Color::from_rgb(0.541, 0.584, 0.965);
-const ACCENT_SOFT: Color = Color::from_rgba(0.431, 0.482, 0.949, 0.20);
-const SELECTION: Color = Color::from_rgba(0.431, 0.482, 0.949, 0.35);
+/// The single accent, used for selection and primary actions (sRGB `#7aa2f7`).
+pub const ACCENT: Color = Color::from_rgb(0.19462, 0.36131, 0.93011);
+const ACCENT_HOVER: Color = Color::from_rgb(0.25016, 0.45641, 1.0);
+const ACCENT_SOFT: Color = Color::from_rgba(0.19462, 0.36131, 0.93011, 0.16);
+const SELECTION: Color = Color::from_rgba(0.19462, 0.36131, 0.93011, 0.30);
 
-/// Additions.
-pub const GREEN: Color = Color::from_rgb(0.247, 0.725, 0.314);
-/// Deletions.
-pub const RED: Color = Color::from_rgb(0.973, 0.320, 0.286);
-/// Hunk headers and modified badges.
-pub const INFO: Color = Color::from_rgb(0.345, 0.651, 1.0);
-/// Untracked / unstaged accents.
-pub const YELLOW: Color = Color::from_rgb(0.824, 0.600, 0.133);
+/// Additions — green (sRGB `#9ece6a`).
+pub const GREEN: Color = Color::from_rgb(0.34191, 0.61721, 0.14413);
+/// Deletions — red (sRGB `#f7768e`).
+pub const RED: Color = Color::from_rgb(0.93011, 0.18116, 0.27050);
+/// Hunk headers and modified badges — cyan (sRGB `#7dcfff`).
+pub const INFO: Color = Color::from_rgb(0.20508, 0.62396, 1.0);
+/// Untracked / unstaged accents — amber (sRGB `#e0af68`).
+pub const YELLOW: Color = Color::from_rgb(0.74540, 0.42869, 0.13843);
 
 /// Full-row tint behind an added diff line.
-pub const GREEN_BG: Color = Color::from_rgba(0.247, 0.725, 0.314, 0.12);
+pub const GREEN_BG: Color = Color::from_rgba(0.34191, 0.61721, 0.14413, 0.12);
 /// Full-row tint behind a removed diff line.
-pub const RED_BG: Color = Color::from_rgba(0.973, 0.320, 0.286, 0.12);
+pub const RED_BG: Color = Color::from_rgba(0.93011, 0.18116, 0.27050, 0.12);
 /// Full-row tint behind a hunk header.
-pub const INFO_BG: Color = Color::from_rgba(0.345, 0.651, 1.0, 0.10);
+pub const INFO_BG: Color = Color::from_rgba(0.20508, 0.62396, 1.0, 0.10);
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -72,7 +80,7 @@ fn with_alpha(color: Color, alpha: f32) -> Color {
 /// falling back to iced's grey built-in `Dark`.
 pub fn theme() -> Theme {
     Theme::custom(
-        "Midnight".to_string(),
+        "Tokyo Night".to_string(),
         Palette {
             background: BG_APP,
             text: TEXT,
@@ -109,6 +117,46 @@ pub fn panel(_: &Theme) -> container::Style {
     }
 }
 
+/// The top application bar: a raised strip carrying the brand and remote
+/// actions. Bottom-only border so it reads as one continuous surface with the
+/// window chrome above it.
+pub fn header(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_PANEL)),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The accent brand mark: a small filled rounded square holding the logo glyph.
+pub fn brand_mark(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(ACCENT)),
+        text_color: Some(Color::WHITE),
+        border: radius(8.0),
+        ..container::Style::default()
+    }
+}
+
+/// The header strip atop the Diff View, carrying the file path and counts.
+pub fn diff_header(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_ELEVATED)),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// The persistent bottom strip.
 pub fn status_bar(_: &Theme) -> container::Style {
     container::Style {
@@ -132,7 +180,8 @@ pub fn dot(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// A file-selection checkbox: accent-filled when checked.
+/// A file-selection checkbox: a soft outlined box that fills with the accent
+/// when checked, with a white tick. The border brightens to the accent on hover.
 pub fn check(_theme: &Theme, status: checkbox::Status) -> checkbox::Style {
     let checked = matches!(
         status,
@@ -142,13 +191,21 @@ pub fn check(_theme: &Theme, status: checkbox::Status) -> checkbox::Style {
     );
     let hovered = matches!(status, checkbox::Status::Hovered { .. });
 
+    let background = if checked {
+        ACCENT
+    } else if hovered {
+        BG_HOVER
+    } else {
+        BG_ELEVATED
+    };
+
     checkbox::Style {
-        background: Background::Color(if checked { ACCENT } else { BG_ELEVATED }),
+        background: Background::Color(background),
         icon_color: Color::WHITE,
         border: Border {
             color: if checked || hovered { ACCENT } else { BORDER },
-            width: 1.0,
-            radius: 5.0.into(),
+            width: 1.5,
+            radius: 6.0.into(),
         },
         text_color: None,
     }
@@ -174,7 +231,9 @@ pub fn diff_row(tint: Option<Color>) -> impl Fn(&Theme) -> container::Style {
 
 // ── Buttons ──────────────────────────────────────────────────────────────
 
-/// A File List row: transparent at rest, washed on hover, accent when selected.
+/// A File List row: transparent at rest, washed on hover, a soft accent veil
+/// when selected. The crisp selection cue is the accent bar drawn by the row
+/// itself (see [`selection_bar`]), so no loud border is needed here.
 pub fn file_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let background = if selected {
@@ -191,44 +250,63 @@ pub fn file_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::S
         button::Style {
             background,
             text_color: TEXT,
-            border: Border {
-                color: if selected { ACCENT } else { Color::TRANSPARENT },
-                width: 1.0,
-                radius: 8.0.into(),
-            },
+            border: radius(8.0),
             ..button::Style::default()
         }
     }
 }
 
-/// A borderless "ghost" text button for bulk header actions.
-pub fn ghost(_theme: &Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered | button::Status::Pressed => Some(Background::Color(BG_HOVER)),
-        _ => None,
+/// A thin vertical bar at the left edge of a File List row. Always occupies the
+/// same space (so selecting a file never shifts the layout); only its color
+/// changes — accent when the row is active, invisible otherwise.
+pub fn selection_bar(active: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(if active { ACCENT } else { Color::TRANSPARENT })),
+        border: radius(2.0),
+        ..container::Style::default()
+    }
+}
+
+/// The shared bordered "pill" used by every command button — remote actions
+/// (Push / Pull) and the File List toolbar (Stage / Unstage / Refresh). A faint
+/// inset surface at rest, accent-tinted border and wash on hover.
+pub fn secondary(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, border_color, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (ACCENT_SOFT, ACCENT, TEXT),
+        button::Status::Disabled => (Color::TRANSPARENT, with_alpha(BORDER, 0.5), TEXT_FAINT),
+        _ => (BG_ELEVATED, BORDER, TEXT),
     };
 
     button::Style {
-        background,
-        text_color: TEXT_MUTED,
-        border: radius(6.0),
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
         ..button::Style::default()
     }
 }
 
-/// A ghost button for a destructive bulk action (red text, red wash on hover).
-pub fn ghost_danger(_theme: &Theme, status: button::Status) -> button::Style {
-    let (background, text_color) = match status {
+/// The danger variant of [`secondary`], for Discard: the same pill shape, in red.
+pub fn secondary_danger(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, border_color, text_color) = match status {
         button::Status::Hovered | button::Status::Pressed => {
-            (Some(Background::Color(with_alpha(RED, 0.18))), RED)
+            (with_alpha(RED, 0.18), RED, RED)
         }
-        _ => (None, with_alpha(RED, 0.85)),
+        button::Status::Disabled => (Color::TRANSPARENT, with_alpha(BORDER, 0.5), TEXT_FAINT),
+        _ => (BG_ELEVATED, with_alpha(RED, 0.45), with_alpha(RED, 0.9)),
     };
 
     button::Style {
-        background,
+        background: Some(Background::Color(background)),
         text_color,
-        border: radius(6.0),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
         ..button::Style::default()
     }
 }

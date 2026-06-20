@@ -135,6 +135,9 @@ pub enum GitMessage {
     /// Discard the checked Unstaged files (or all). First press arms the
     /// confirmation; the second press performs it.
     DiscardChecked,
+    /// Re-read the Working Tree and Staging Area (picks up edits made outside
+    /// the app) and reload the active Diff.
+    Refresh,
     Commit,
     Push,
     Pull,
@@ -237,6 +240,16 @@ impl App {
                     for path in paths {
                         self.dispatch(GitCommand::Discard(path));
                     }
+                }
+            }
+            GitMessage::Refresh => {
+                self.dispatch(GitCommand::RefreshStatus);
+                // Also refresh the open Diff in case the file changed on disk.
+                if let Some(selection) = &self.repo.selected {
+                    self.dispatch(GitCommand::LoadDiff {
+                        path: selection.path.clone(),
+                        staged: selection.staged,
+                    });
                 }
             }
             GitMessage::Commit => self.start_commit(),
@@ -508,6 +521,8 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Named(Named::ArrowDown) => Message::Ui(UiMessage::SelectNext),
         Key::Named(Named::ArrowUp) => Message::Ui(UiMessage::SelectPrevious),
         Key::Named(Named::Escape) => Message::Ui(UiMessage::DismissStatus),
+        Key::Named(Named::F5) => Message::Git(GitMessage::Refresh),
+        Key::Character("r") if command => Message::Git(GitMessage::Refresh),
         Key::Named(Named::Enter) if command => Message::Git(GitMessage::Commit),
         Key::Character("s") if command => Message::Git(GitMessage::StageSelected),
         Key::Character("u") if command => Message::Git(GitMessage::UnstageSelected),
