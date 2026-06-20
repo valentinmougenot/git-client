@@ -57,6 +57,9 @@ pub struct App {
     /// The files checked for a bulk action (the action targets). Distinct from
     /// `repo.selected`, which is the one file whose Diff is shown.
     pub checked: HashSet<Selection>,
+    /// Directory nodes the user has collapsed in the File Tree. A directory is
+    /// expanded unless its key is present here; see [`App::dir_collapsed`].
+    pub collapsed: HashSet<String>,
     /// Whether Discard is armed, awaiting a confirming second press.
     pub discard_armed: bool,
 }
@@ -89,6 +92,12 @@ pub struct RepoState {
 pub struct Selection {
     pub path: String,
     pub staged: bool,
+}
+
+/// The key under which a File Tree directory's collapsed state is stored. The
+/// side prefix keeps the Unstaged and Staged copies of a path independent.
+fn dir_key(staged: bool, path: &str) -> String {
+    format!("{}\u{1}{path}", if staged { 's' } else { 'u' })
 }
 
 /// In-progress commit message, whether a Commit is running, and whether the
@@ -146,6 +155,17 @@ pub enum UiMessage {
     ToggleSection {
         staged: bool,
     },
+    /// Collapse or expand a directory node in the File Tree.
+    ToggleDir {
+        staged: bool,
+        path: String,
+    },
+    /// Check or uncheck every file under a directory node, given its descendant
+    /// file paths. Checks all unless all are already checked, then clears them.
+    ToggleDirChecked {
+        staged: bool,
+        paths: Vec<String>,
+    },
     CommitMessageChanged(String),
     /// Toggle whether the next Commit amends HEAD.
     ToggleAmend,
@@ -195,8 +215,15 @@ impl App {
             notification: Notification::default(),
             operation: None,
             checked: HashSet::new(),
+            collapsed: HashSet::new(),
             discard_armed: false,
         }
+    }
+
+    /// Whether a File Tree directory is collapsed. `staged` separates the two
+    /// sections so the same path can be expanded on one side and not the other.
+    pub fn dir_collapsed(&self, staged: bool, path: &str) -> bool {
+        self.collapsed.contains(&dir_key(staged, path))
     }
 
     /// Send a command to the Git Worker, if it has booted.
@@ -219,6 +246,13 @@ impl App {
                 }
             }
             UiMessage::ToggleSection { staged } => self.toggle_section(staged),
+            UiMessage::ToggleDir { staged, path } => {
+                let key = dir_key(staged, &path);
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+            }
+            UiMessage::ToggleDirChecked { staged, paths } => self.toggle_dir_checks(staged, paths),
             UiMessage::CommitMessageChanged(value) => self.commit.message = value,
             UiMessage::ToggleAmend => self.toggle_amend(),
             UiMessage::DismissStatus => self.status.message = None,
@@ -361,6 +395,27 @@ impl App {
             .collect();
 
         for item in items {
+            if all_checked {
+                self.checked.remove(&item);
+            } else {
+                self.checked.insert(item);
+            }
+        }
+    }
+
+    /// Check or uncheck every file under a directory: clear them if all are
+    /// already checked, otherwise check the lot.
+    fn toggle_dir_checks(&mut self, staged: bool, paths: Vec<String>) {
+        let all_checked = !paths.is_empty()
+            && paths.iter().all(|path| {
+                self.checked.contains(&Selection {
+                    path: path.clone(),
+                    staged,
+                })
+            });
+
+        for path in paths {
+            let item = Selection { path, staged };
             if all_checked {
                 self.checked.remove(&item);
             } else {
@@ -898,6 +953,54 @@ mod tests {
             Message::Ui(UiMessage::ToggleSection { staged: false }),
         );
         assert!(app.checked.is_empty());
+    }
+
+    #[test]
+    fn toggle_dir_checks_all_descendants_then_clears() {
+        let mut app = App::new();
+        let paths = vec!["src/ui/mod.rs".to_string(), "src/app.rs".to_string()];
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ToggleDirChecked {
+                staged: false,
+                paths: paths.clone(),
+            }),
+        );
+        assert_eq!(app.checked.len(), 2);
+        assert!(app.checked.contains(&Selection {
+            path: "src/ui/mod.rs".to_string(),
+            staged: false,
+        }));
+
+        // A second toggle, with all already checked, clears them.
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ToggleDirChecked {
+                staged: false,
+                paths,
+            }),
+        );
+        assert!(app.checked.is_empty());
+    }
+
+    #[test]
+    fn toggle_dir_checks_completes_a_partial_selection() {
+        let mut app = App::new();
+        app.checked.insert(Selection {
+            path: "src/app.rs".to_string(),
+            staged: false,
+        });
+
+        // With only one of two files checked, toggling checks the rest.
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ToggleDirChecked {
+                staged: false,
+                paths: vec!["src/ui/mod.rs".to_string(), "src/app.rs".to_string()],
+            }),
+        );
+        assert_eq!(app.checked.len(), 2);
     }
 
     #[test]

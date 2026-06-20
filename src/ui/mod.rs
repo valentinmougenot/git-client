@@ -6,6 +6,7 @@
 
 mod highlight;
 mod style;
+mod tree;
 mod worddiff;
 
 use iced::widget::{
@@ -195,9 +196,7 @@ fn file_list(app: &App) -> Element<'_, Message> {
     if repo.unstaged.is_empty() {
         items.push(placeholder("Working tree is clean"));
     } else {
-        for entry in &repo.unstaged {
-            items.push(file_row(app, entry, false));
-        }
+        push_tree(app, &repo.unstaged, false, &mut items);
     }
 
     items.push(gap(10.0));
@@ -205,13 +204,119 @@ fn file_list(app: &App) -> Element<'_, Message> {
     if repo.staged.is_empty() {
         items.push(placeholder("Nothing staged"));
     } else {
-        for entry in &repo.staged {
-            items.push(file_row(app, entry, true));
-        }
+        push_tree(app, &repo.staged, true, &mut items);
     }
 
     scrollable(column(items).spacing(3).padding(12))
         .height(Fill)
+        .into()
+}
+
+/// Render a section's files as a collapsible directory tree, appending one row
+/// per visible node (directories and the files under expanded ones) to `items`.
+fn push_tree<'a>(
+    app: &'a App,
+    entries: &'a [FileEntry],
+    staged: bool,
+    items: &mut Vec<Element<'a, Message>>,
+) {
+    for node in tree::build(entries) {
+        push_node(app, node, staged, 0, items);
+    }
+}
+
+fn push_node<'a>(
+    app: &'a App,
+    node: tree::Node<'a>,
+    staged: bool,
+    depth: usize,
+    items: &mut Vec<Element<'a, Message>>,
+) {
+    match node {
+        tree::Node::File(entry) => items.push(file_row(app, entry, staged, depth)),
+        tree::Node::Dir {
+            name,
+            path,
+            children,
+        } => {
+            let collapsed = app.dir_collapsed(staged, &path);
+            let paths = tree::file_paths(&children);
+            let all_checked = paths.iter().all(|p| {
+                app.checked.contains(&Selection {
+                    path: p.clone(),
+                    staged,
+                })
+            });
+            items.push(dir_row(&name, &path, staged, depth, collapsed, paths, all_checked));
+            if !collapsed {
+                for child in children {
+                    push_node(app, child, staged, depth + 1, items);
+                }
+            }
+        }
+    }
+}
+
+/// One directory node: a "select all under here" checkbox, then an indented,
+/// clickable row (chevron + folder name + file count) that toggles the directory
+/// open or closed. The checkbox sits outside that button so it stages the folder
+/// without also collapsing it.
+fn dir_row<'a>(
+    name: &str,
+    path: &str,
+    staged: bool,
+    depth: usize,
+    collapsed: bool,
+    paths: Vec<String>,
+    all_checked: bool,
+) -> Element<'a, Message> {
+    let count = paths.len();
+    let toggle_paths = paths.clone();
+    let check = checkbox(all_checked)
+        .on_toggle(move |_| {
+            Message::Ui(UiMessage::ToggleDirChecked {
+                staged,
+                paths: toggle_paths.clone(),
+            })
+        })
+        .size(16)
+        .style(style::check);
+
+    let chevron = container(
+        text(if collapsed { "▸" } else { "▾" })
+            .size(10)
+            .color(style::TEXT_FAINT),
+    )
+    .width(Length::Fixed(16.0))
+    .center_x(Length::Fixed(16.0));
+
+    let toggle = button(
+        row![
+            chevron,
+            text(name.to_string()).size(14).color(style::TEXT_MUTED),
+            text(count.to_string()).size(11).color(style::TEXT_FAINT),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    )
+    .on_press(Message::Ui(UiMessage::ToggleDir {
+        staged,
+        path: path.to_string(),
+    }))
+    .width(Fill)
+    .padding([6, 8])
+    .style(style::file_item(false));
+
+    row![tree_indent(depth), check, toggle]
+        .spacing(8)
+        .align_y(Center)
+        .into()
+}
+
+/// A fixed-width spacer that indents a tree row to its `depth`.
+fn tree_indent<'a>(depth: usize) -> Element<'a, Message> {
+    container(text(""))
+        .width(Length::Fixed(depth as f32 * 16.0))
         .into()
 }
 
@@ -357,11 +462,13 @@ fn placeholder<'a>(label: &str) -> Element<'a, Message> {
 
 /// One file: a checkbox (action target), a colored status dot, and the
 /// filename (clicking it shows the Diff).
-fn file_row<'a>(app: &App, entry: &FileEntry, staged: bool) -> Element<'a, Message> {
+fn file_row<'a>(app: &App, entry: &FileEntry, staged: bool, depth: usize) -> Element<'a, Message> {
     let item = Selection {
         path: entry.path.clone(),
         staged,
     };
+    // Show just the file name; its directory is conveyed by the tree.
+    let leaf = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
     let active = app.repo.selected.as_ref() == Some(&item);
     let is_checked = app.checked.contains(&item);
 
@@ -393,7 +500,7 @@ fn file_row<'a>(app: &App, entry: &FileEntry, staged: bool) -> Element<'a, Messa
         .style(style::selection_bar(active));
 
     let name = button(
-        row![bar, dot, text(entry.path.clone()).size(14)]
+        row![bar, dot, text(leaf).size(14)]
             .spacing(10)
             .align_y(Center),
     )
@@ -405,7 +512,10 @@ fn file_row<'a>(app: &App, entry: &FileEntry, staged: bool) -> Element<'a, Messa
     .padding([6, 8])
     .style(style::file_item(active));
 
-    row![check, name].spacing(8).align_y(Center).into()
+    row![tree_indent(depth), check, name]
+        .spacing(8)
+        .align_y(Center)
+        .into()
 }
 
 fn badge_color(change: ChangeKind) -> iced::Color {
