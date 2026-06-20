@@ -69,6 +69,10 @@ pub const GREEN_BG: Color = Color::from_rgba(0.34191, 0.61721, 0.14413, 0.12);
 pub const RED_BG: Color = Color::from_rgba(0.93011, 0.18116, 0.27050, 0.12);
 /// Full-row tint behind a hunk header.
 pub const INFO_BG: Color = Color::from_rgba(0.20508, 0.62396, 1.0, 0.10);
+/// Stronger tint behind the precise words added within an addition line.
+pub const GREEN_BG_STRONG: Color = Color::from_rgba(0.34191, 0.61721, 0.14413, 0.30);
+/// Stronger tint behind the precise words removed within a deletion line.
+pub const RED_BG_STRONG: Color = Color::from_rgba(0.93011, 0.18116, 0.27050, 0.30);
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 

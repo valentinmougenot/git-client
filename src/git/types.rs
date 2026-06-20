@@ -22,6 +22,12 @@ pub enum GitCommand {
     UnstageFile(String),
     /// Empty the Staging Area, returning everything to the Working Tree.
     UnstageAll,
+    /// Stage a single hunk of a file, identified by its index in the file's
+    /// Working Tree (unstaged) Diff.
+    StageHunk { path: String, hunk: usize },
+    /// Unstage a single hunk of a file, identified by its index in the file's
+    /// Staging Area (staged) Diff.
+    UnstageHunk { path: String, hunk: usize },
     /// Discard Working Tree changes for one file: revert a tracked file to its
     /// committed/staged state, or delete an Untracked File (nothing to revert).
     Discard(String),

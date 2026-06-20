@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::mpsc::Receiver;
 
 use git2::{
-    Cred, CredentialType, DiffFormat, DiffOptions, FetchOptions, ObjectType, PushOptions,
-    RemoteCallbacks, Repository, Status, StatusOptions,
+    ApplyLocation, ApplyOptions, Cred, CredentialType, DiffFormat, DiffOptions, FetchOptions,
+    ObjectType, PushOptions, RemoteCallbacks, Repository, Status, StatusOptions,
 };
 
 use super::types::*;
@@ -92,6 +92,25 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
                 events.emit(GitEvent::Error(error));
             }
             emit_status(repo, events);
+        }
+        GitCommand::StageHunk { path, hunk } => {
+            if let Err(error) = stage_hunk(repo, &path, hunk) {
+                events.emit(GitEvent::Error(GitError::new("stage hunk", &error)));
+            }
+            emit_status(repo, events);
+            // Refresh the Working Tree diff the user is looking at.
+            if let Ok(diff) = load_diff(repo, &path, false) {
+                events.emit(GitEvent::DiffLoaded(diff));
+            }
+        }
+        GitCommand::UnstageHunk { path, hunk } => {
+            if let Err(error) = unstage_hunk(repo, &path, hunk) {
+                events.emit(GitEvent::Error(GitError::new("unstage hunk", &error)));
+            }
+            emit_status(repo, events);
+            if let Ok(diff) = load_diff(repo, &path, true) {
+                events.emit(GitEvent::DiffLoaded(diff));
+            }
         }
         GitCommand::Commit(message) => {
             match commit(repo, &message) {
@@ -323,6 +342,48 @@ fn unstage(repo: &Repository, path: &str) -> Result<(), git2::Error> {
             index.write()
         }
     }
+}
+
+/// Stage a single hunk: build the Working Tree diff for the file and apply only
+/// the hunk at `index` to the index. Untracked files have no index entry to
+/// patch, so they fall back to staging the whole file.
+fn stage_hunk(repo: &Repository, path: &str, index: usize) -> Result<(), git2::Error> {
+    if repo.status_file(Path::new(path))?.contains(Status::WT_NEW) {
+        return stage(repo, path);
+    }
+
+    let mut options = DiffOptions::new();
+    options.pathspec(path);
+    let diff = repo.diff_index_to_workdir(None, Some(&mut options))?;
+    apply_hunk(repo, &diff, index)
+}
+
+/// Unstage a single hunk: build the Staging Area diff *reversed* (so applying it
+/// undoes the staged change) and apply only the hunk at `index` to the index.
+fn unstage_hunk(repo: &Repository, path: &str, index: usize) -> Result<(), git2::Error> {
+    let head_tree = match repo.head() {
+        Ok(head) => Some(head.peel_to_tree()?),
+        Err(_) => None,
+    };
+
+    let mut options = DiffOptions::new();
+    options.pathspec(path).reverse(true);
+    let diff = repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut options))?;
+    apply_hunk(repo, &diff, index)
+}
+
+/// Apply exactly the hunk at `index` of `diff` to the index. The callback is
+/// invoked once per hunk in order, matching the indexing the UI built from the
+/// same diff.
+fn apply_hunk(repo: &Repository, diff: &git2::Diff, index: usize) -> Result<(), git2::Error> {
+    let mut seen = 0;
+    let mut options = ApplyOptions::new();
+    options.hunk_callback(|_hunk| {
+        let keep = seen == index;
+        seen += 1;
+        keep
+    });
+    repo.apply(diff, ApplyLocation::Index, Some(&mut options))
 }
 
 /// Stage every Unstaged and Untracked File at once.
@@ -905,6 +966,85 @@ mod tests {
         let history = load_history(&repo, 10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].summary, "amended");
+    }
+
+    /// A file whose two edits (near the top and near the bottom) land in two
+    /// separate hunks. Returns the path after committing the base and writing
+    /// the modified version.
+    fn two_hunk_file(dir: &Path, repo: &Repository, events: &Collector) {
+        let base: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        write(dir, "a.txt", &base);
+        process(repo, GitCommand::StageFile("a.txt".into()), events);
+        process(repo, GitCommand::Commit("base".into()), events);
+
+        let mut lines: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        lines[1] = "line 2 CHANGED".to_string();
+        lines[18] = "line 19 CHANGED".to_string();
+        let modified: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        write(dir, "a.txt", &modified);
+    }
+
+    fn added_lines(diff: &Diff) -> Vec<String> {
+        diff.lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Addition)
+            .map(|l| l.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn stage_hunk_stages_only_the_targeted_hunk() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        two_hunk_file(dir.path(), &repo, &events);
+
+        process(
+            &repo,
+            GitCommand::StageHunk {
+                path: "a.txt".into(),
+                hunk: 0,
+            },
+            &events,
+        );
+
+        // The file is now partially staged: it appears on both sides.
+        let (unstaged, staged) = events.last_status();
+        assert_eq!(paths(&staged), ["a.txt"]);
+        assert_eq!(paths(&unstaged), ["a.txt"]);
+
+        // The first change is staged; the second is not.
+        let staged_added = added_lines(&load_diff(&repo, "a.txt", true).unwrap());
+        assert!(staged_added.iter().any(|l| l.contains("line 2 CHANGED")));
+        assert!(!staged_added.iter().any(|l| l.contains("line 19 CHANGED")));
+
+        let unstaged_added = added_lines(&load_diff(&repo, "a.txt", false).unwrap());
+        assert!(unstaged_added.iter().any(|l| l.contains("line 19 CHANGED")));
+    }
+
+    #[test]
+    fn unstage_hunk_unstages_only_the_targeted_hunk() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        two_hunk_file(dir.path(), &repo, &events);
+        process(&repo, GitCommand::StageAll, &events);
+
+        // Unstage just the first hunk.
+        process(
+            &repo,
+            GitCommand::UnstageHunk {
+                path: "a.txt".into(),
+                hunk: 0,
+            },
+            &events,
+        );
+
+        // The first change returns to the Working Tree; the second stays staged.
+        let staged_added = added_lines(&load_diff(&repo, "a.txt", true).unwrap());
+        assert!(!staged_added.iter().any(|l| l.contains("line 2 CHANGED")));
+        assert!(staged_added.iter().any(|l| l.contains("line 19 CHANGED")));
+
+        let unstaged_added = added_lines(&load_diff(&repo, "a.txt", false).unwrap());
+        assert!(unstaged_added.iter().any(|l| l.contains("line 2 CHANGED")));
     }
 
     #[test]

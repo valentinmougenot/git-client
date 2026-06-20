@@ -171,6 +171,10 @@ pub enum GitMessage {
     /// Discard the checked Unstaged files (or all). First press arms the
     /// confirmation; the second press performs it.
     DiscardChecked,
+    /// Stage a single hunk of a file (from the Working Tree Diff).
+    StageHunk { path: String, hunk: usize },
+    /// Unstage a single hunk of a file (from the Staging Area Diff).
+    UnstageHunk { path: String, hunk: usize },
     /// Re-read the Working Tree and Staging Area (picks up edits made outside
     /// the app) and reload the active Diff.
     Refresh,
@@ -311,6 +315,12 @@ impl App {
                 if self.view == ViewMode::History {
                     self.dispatch(GitCommand::LoadHistory);
                 }
+            }
+            GitMessage::StageHunk { path, hunk } => {
+                self.dispatch(GitCommand::StageHunk { path, hunk });
+            }
+            GitMessage::UnstageHunk { path, hunk } => {
+                self.dispatch(GitCommand::UnstageHunk { path, hunk });
             }
             GitMessage::Commit => self.start_commit(),
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),

@@ -6,6 +6,7 @@
 
 mod highlight;
 mod style;
+mod worddiff;
 
 use iced::widget::{
     button, checkbox, column, container, rich_text, row, scrollable, space, span, text, text_input,
@@ -512,16 +513,18 @@ fn commit_detail_view(history: &HistoryState) -> Element<'_, Message> {
     // The detail spans several files; track the current file (from the injected
     // "● path" header lines) so each line is highlighted for its own language.
     let mut lang = highlight::Lang::Plain;
+    let emphasis = intraline_emphasis(&detail.lines);
     let rows: Vec<Element<Message>> = detail
         .lines
         .iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(idx, line)| {
             if line.kind == DiffLineKind::Header
                 && let Some(path) = line.content.strip_prefix("● ")
             {
                 lang = highlight::lang_for(path);
             }
-            diff_line(line, lang)
+            diff_line(line, lang, emphasis[idx].as_deref())
         })
         .collect();
     let body = scrollable(column(rows).padding([8, 4])).height(Fill).width(Fill);
@@ -568,12 +571,80 @@ fn diff_view(repo: &RepoState) -> Element<'_, Message> {
     }
 
     let lang = highlight::lang_for(&diff.path);
-    let rows: Vec<Element<Message>> = diff.lines.iter().map(|line| diff_line(line, lang)).collect();
+    // Pair removed lines with the additions that replaced them so we can tint
+    // just the words that changed within each.
+    let emphasis = intraline_emphasis(&diff.lines);
+    // Each hunk header (kind Header in a single-file diff) gets a Stage/Unstage
+    // action; the index counts hunks in display order so it matches the worker.
+    let mut hunk = 0;
+    let rows: Vec<Element<Message>> = diff
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if line.kind == DiffLineKind::Header {
+                let row = hunk_header_row(&line.content, &diff.path, hunk, diff.staged);
+                hunk += 1;
+                row
+            } else {
+                diff_line(line, lang, emphasis[idx].as_deref())
+            }
+        })
+        .collect();
     let body = scrollable(column(rows).padding([8, 4]))
         .height(Fill)
         .width(Fill);
 
     column![diff_header(diff), body].spacing(10).into()
+}
+
+/// A hunk header line, carrying the `@@ … @@` text and a per-hunk action:
+/// "Stage" on the Working Tree side, "Unstage" on the Staging Area side.
+fn hunk_header_row<'a>(
+    content: &str,
+    path: &str,
+    hunk: usize,
+    staged: bool,
+) -> Element<'a, Message> {
+    let (label, message) = if staged {
+        (
+            "Unstage",
+            GitMessage::UnstageHunk {
+                path: path.to_string(),
+                hunk,
+            },
+        )
+    } else {
+        (
+            "Stage",
+            GitMessage::StageHunk {
+                path: path.to_string(),
+                hunk,
+            },
+        )
+    };
+
+    let action = button(text(label.to_string()).size(11))
+        .on_press(Message::Git(message))
+        .padding([2, 9])
+        .style(style::secondary);
+
+    container(
+        row![
+            text(content.to_string())
+                .font(Font::MONOSPACE)
+                .size(13)
+                .color(style::INFO),
+            space::horizontal(),
+            action,
+        ]
+        .spacing(10)
+        .align_y(Center),
+    )
+    .style(style::diff_row(Some(style::INFO_BG)))
+    .width(Fill)
+    .padding([3, 10])
+    .into()
 }
 
 /// The strip atop the Diff View: the file's side, its path, and the count of
@@ -617,15 +688,58 @@ fn diff_header(diff: &Diff) -> Element<'_, Message> {
     .into()
 }
 
+/// Walk the diff's lines, pairing each run of removed lines with the run of
+/// added lines that follows it, and compute the changed-word ranges for each
+/// pair. Returns a slot per line: `Some(ranges)` to emphasize within that line,
+/// `None` to leave it whole. Lines outside a paired run, or pairs too dissimilar
+/// to be worth it, stay `None`.
+fn intraline_emphasis(lines: &[DiffLine]) -> Vec<Option<Vec<(usize, usize)>>> {
+    let mut emphasis = vec![None; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind != DiffLineKind::Deletion {
+            i += 1;
+            continue;
+        }
+        let del_start = i;
+        while i < lines.len() && lines[i].kind == DiffLineKind::Deletion {
+            i += 1;
+        }
+        let add_start = i;
+        while i < lines.len() && lines[i].kind == DiffLineKind::Addition {
+            i += 1;
+        }
+        let pairs = (add_start - del_start).min(i - add_start);
+        for k in 0..pairs {
+            let (d, a) = (del_start + k, add_start + k);
+            if let Some(e) = worddiff::diff(&lines[d].content, &lines[a].content) {
+                emphasis[d] = Some(e.old);
+                emphasis[a] = Some(e.new);
+            }
+        }
+    }
+    emphasis
+}
+
 /// One diff line: a two-column line-number gutter, a marker, and the content,
 /// over a full-width tint that conveys add/remove without tinting the text. The
 /// content is syntax-highlighted (`lang`), except header lines which stay flat.
-fn diff_line<'a>(line: &'a DiffLine, lang: highlight::Lang) -> Element<'a, Message> {
+/// When `emphasis` is set, the listed char ranges (the words that actually
+/// changed) get a stronger background over the row tint.
+fn diff_line<'a>(
+    line: &'a DiffLine,
+    lang: highlight::Lang,
+    emphasis: Option<&[(usize, usize)]>,
+) -> Element<'a, Message> {
     let (marker, marker_color, tint) = match line.kind {
         DiffLineKind::Addition => ("+", style::GREEN, Some(style::GREEN_BG)),
         DiffLineKind::Deletion => ("-", style::RED, Some(style::RED_BG)),
         DiffLineKind::Context => (" ", style::TEXT_FAINT, None),
         DiffLineKind::Header => ("", style::INFO, Some(style::INFO_BG)),
+    };
+    let emphasis_bg = match line.kind {
+        DiffLineKind::Addition => style::GREEN_BG_STRONG,
+        _ => style::RED_BG_STRONG,
     };
 
     let gutter = format!(
@@ -643,10 +757,30 @@ fn diff_line<'a>(line: &'a DiffLine, lang: highlight::Lang) -> Element<'a, Messa
             .color(style::INFO)
             .into()
     } else {
-        let spans: Vec<iced::widget::text::Span<()>> = highlight::spans(&line.content, lang)
-            .into_iter()
-            .map(|(fragment, color)| span(fragment).color(color))
-            .collect();
+        let emphasis = emphasis.unwrap_or(&[]);
+        let mut spans: Vec<iced::widget::text::Span<()>> = Vec::new();
+        // Highlight fragments tile the content in order; split each one further
+        // at emphasis boundaries so changed words get the stronger background
+        // while keeping their syntax color.
+        let mut pos = 0; // char offset into the content
+        for (fragment, color) in highlight::spans(&line.content, lang) {
+            let chars: Vec<char> = fragment.chars().collect();
+            let mut j = 0;
+            while j < chars.len() {
+                let emph = in_ranges(pos + j, emphasis);
+                let run = j;
+                while j < chars.len() && in_ranges(pos + j, emphasis) == emph {
+                    j += 1;
+                }
+                let text: String = chars[run..j].iter().collect();
+                let mut sp = span(text).color(color);
+                if emph {
+                    sp = sp.background(emphasis_bg);
+                }
+                spans.push(sp);
+            }
+            pos += chars.len();
+        }
         rich_text(spans).font(Font::MONOSPACE).size(13).into()
     };
 
@@ -673,6 +807,11 @@ fn diff_line<'a>(line: &'a DiffLine, lang: highlight::Lang) -> Element<'a, Messa
 
 fn lineno(value: Option<u32>) -> String {
     value.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// Whether char offset `pos` falls inside any of the half-open emphasis ranges.
+fn in_ranges(pos: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|&(start, end)| pos >= start && pos < end)
 }
 
 // ── Commit Panel ─────────────────────────────────────────────────────────
