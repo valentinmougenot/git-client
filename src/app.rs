@@ -13,7 +13,7 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Subscription, Task};
 
-use crate::git::{self, Diff, FileEntry, GitCommand, GitEvent};
+use crate::git::{self, Diff, FileEntry, GitCommand, GitEvent, HeadInfo};
 use crate::ui;
 
 /// How long a success Notification stays on screen.
@@ -46,11 +46,14 @@ pub struct App {
     pub discard_armed: bool,
 }
 
-/// Working Tree and Staging Area contents, the selected file, and its Diff.
+/// Working Tree and Staging Area contents, the HEAD/branch context, the
+/// selected file, and its Diff.
 #[derive(Default)]
 pub struct RepoState {
     pub unstaged: Vec<FileEntry>,
     pub staged: Vec<FileEntry>,
+    /// Current branch, sync state with the Remote, and last Commit.
+    pub head: HeadInfo,
     pub selected: Option<Selection>,
     pub diff: Option<Diff>,
 }
@@ -301,9 +304,14 @@ impl App {
 
     fn update_event(&mut self, event: GitEvent) {
         match event {
-            GitEvent::StatusLoaded { unstaged, staged } => {
+            GitEvent::StatusLoaded {
+                unstaged,
+                staged,
+                head,
+            } => {
                 self.repo.unstaged = unstaged;
                 self.repo.staged = staged;
+                self.repo.head = head;
                 self.reconcile_selection();
                 self.prune_checked();
             }
@@ -553,6 +561,15 @@ mod tests {
         }
     }
 
+    /// A `StatusLoaded` event with default (empty) HEAD context.
+    fn status_event(unstaged: Vec<FileEntry>, staged: Vec<FileEntry>) -> Message {
+        Message::GitEvent(GitEvent::StatusLoaded {
+            unstaged,
+            staged,
+            head: HeadInfo::default(),
+        })
+    }
+
     fn diff(path: &str, staged: bool) -> Diff {
         Diff {
             path: path.to_string(),
@@ -572,10 +589,10 @@ mod tests {
 
         update(
             &mut app,
-            Message::GitEvent(GitEvent::StatusLoaded {
-                unstaged: vec![entry("a.txt", ChangeKind::Modified)],
-                staged: vec![entry("b.txt", ChangeKind::Added)],
-            }),
+            status_event(
+                vec![entry("a.txt", ChangeKind::Modified)],
+                vec![entry("b.txt", ChangeKind::Added)],
+            ),
         );
 
         assert_eq!(app.repo.unstaged.len(), 1);
@@ -593,13 +610,7 @@ mod tests {
         app.repo.diff = Some(diff("a.txt", false));
 
         // A refresh in which "a.txt" is no longer unstaged.
-        update(
-            &mut app,
-            Message::GitEvent(GitEvent::StatusLoaded {
-                unstaged: vec![],
-                staged: vec![],
-            }),
-        );
+        update(&mut app, status_event(vec![], vec![]));
 
         assert!(app.repo.selected.is_none());
         assert!(app.repo.diff.is_none());
@@ -615,10 +626,7 @@ mod tests {
 
         update(
             &mut app,
-            Message::GitEvent(GitEvent::StatusLoaded {
-                unstaged: vec![entry("a.txt", ChangeKind::Modified)],
-                staged: vec![],
-            }),
+            status_event(vec![entry("a.txt", ChangeKind::Modified)], vec![]),
         );
 
         assert_eq!(
@@ -772,13 +780,7 @@ mod tests {
         });
 
         // A refresh where "a.txt" is no longer unstaged drops it from the set.
-        update(
-            &mut app,
-            Message::GitEvent(GitEvent::StatusLoaded {
-                unstaged: vec![],
-                staged: vec![],
-            }),
-        );
+        update(&mut app, status_event(vec![], vec![]));
         assert!(app.checked.is_empty());
     }
 

@@ -114,12 +114,98 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
     }
 }
 
-/// Read the Working Tree and Staging Area and emit a `StatusLoaded` event.
+/// Read the Working Tree, Staging Area, and HEAD context, and emit one
+/// `StatusLoaded` event carrying all three as a consistent snapshot.
 fn emit_status(repo: &Repository, events: &impl EventSink) {
     match status(repo) {
-        Ok((unstaged, staged)) => events.emit(GitEvent::StatusLoaded { unstaged, staged }),
+        Ok((unstaged, staged)) => events.emit(GitEvent::StatusLoaded {
+            unstaged,
+            staged,
+            head: head_info(repo),
+        }),
         Err(error) => events.emit(GitEvent::Error(GitError::new("refresh status", &error))),
     }
+}
+
+/// Read HEAD and its relationship to the Remote, best-effort. Every piece is
+/// optional: an empty repo, a detached HEAD, or a branch with no upstream each
+/// just leave the corresponding fields empty rather than failing the refresh.
+fn head_info(repo: &Repository) -> HeadInfo {
+    let has_remote = repo.find_remote("origin").is_ok();
+
+    let head = match repo.head() {
+        Ok(head) => head,
+        // No resolvable HEAD (typically an unborn branch with no commits yet):
+        // still surface the branch name read from the symbolic ref.
+        Err(_) => {
+            return HeadInfo {
+                branch: unborn_branch_name(repo),
+                has_remote,
+                ..HeadInfo::default()
+            };
+        }
+    };
+
+    let detached = repo.head_detached().unwrap_or(false);
+    let branch = if detached {
+        None
+    } else {
+        head.shorthand().ok().map(str::to_string)
+    };
+
+    let last_commit = head.peel_to_commit().ok().map(|commit| CommitSummary {
+        short_sha: short_sha(commit.id()),
+        summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
+    });
+
+    let (upstream, ahead, behind) = upstream_divergence(repo, branch.as_deref());
+
+    HeadInfo {
+        branch,
+        detached,
+        has_remote,
+        upstream,
+        ahead,
+        behind,
+        last_commit,
+    }
+}
+
+/// The configured upstream of `branch` and how far the local branch is
+/// ahead/behind it. Returns `(None, 0, 0)` when there is no branch or upstream.
+fn upstream_divergence(repo: &Repository, branch: Option<&str>) -> (Option<String>, usize, usize) {
+    let Some(name) = branch else {
+        return (None, 0, 0);
+    };
+    let Ok(local) = repo.find_branch(name, git2::BranchType::Local) else {
+        return (None, 0, 0);
+    };
+    let Ok(upstream) = local.upstream() else {
+        return (None, 0, 0);
+    };
+
+    let upstream_name = upstream.name().ok().flatten().map(str::to_string);
+
+    match (local.get().target(), upstream.get().target()) {
+        (Some(local_oid), Some(upstream_oid)) => {
+            let (ahead, behind) = repo
+                .graph_ahead_behind(local_oid, upstream_oid)
+                .unwrap_or((0, 0));
+            (upstream_name, ahead, behind)
+        }
+        _ => (upstream_name, 0, 0),
+    }
+}
+
+/// The branch name of an unborn HEAD, read from its symbolic target
+/// (`refs/heads/<name>`), if resolvable.
+fn unborn_branch_name(repo: &Repository) -> Option<String> {
+    repo.find_reference("HEAD")
+        .ok()?
+        .symbolic_target()
+        .ok()
+        .flatten()
+        .map(|target| target.trim_start_matches("refs/heads/").to_string())
 }
 
 /// Collect the Unstaged/Untracked files and the Staged files.
@@ -519,9 +605,9 @@ mod tests {
                 .iter()
                 .rev()
                 .find_map(|event| match event {
-                    GitEvent::StatusLoaded { unstaged, staged } => {
-                        Some((unstaged.clone(), staged.clone()))
-                    }
+                    GitEvent::StatusLoaded {
+                        unstaged, staged, ..
+                    } => Some((unstaged.clone(), staged.clone())),
                     _ => None,
                 })
                 .expect("expected a StatusLoaded event")
@@ -529,6 +615,19 @@ mod tests {
 
         fn events(&self) -> Vec<GitEvent> {
             self.0.borrow().clone()
+        }
+
+        /// The HEAD context from the most recent `StatusLoaded`.
+        fn last_head(&self) -> HeadInfo {
+            self.0
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    GitEvent::StatusLoaded { head, .. } => Some(head.clone()),
+                    _ => None,
+                })
+                .expect("expected a StatusLoaded event")
         }
     }
 
@@ -560,6 +659,33 @@ mod tests {
         let (unstaged, staged) = events.last_status();
         assert!(unstaged.is_empty());
         assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn head_info_reports_branch_and_last_commit() {
+        let (dir, repo) = temp_repo();
+
+        // Before any commit: the branch is unborn but named, no last commit,
+        // no remote, no divergence.
+        let events = Collector::default();
+        process(&repo, GitCommand::RefreshStatus, &events);
+        let head = events.last_head();
+        assert!(head.last_commit.is_none());
+        assert!(!head.has_remote);
+        assert_eq!((head.ahead, head.behind), (0, 0));
+        assert!(head.upstream.is_none());
+
+        // After a commit: the last commit summary is surfaced.
+        write(dir.path(), "a.txt", "x\n");
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Commit("hello world".into()), &events);
+        process(&repo, GitCommand::RefreshStatus, &events);
+
+        let head = events.last_head();
+        assert!(head.branch.is_some(), "expected a named branch");
+        assert!(!head.detached);
+        let commit = head.last_commit.expect("expected a last commit");
+        assert_eq!(commit.summary, "hello world");
     }
 
     #[test]

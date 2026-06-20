@@ -10,7 +10,7 @@ use iced::widget::{button, checkbox, column, container, row, scrollable, space, 
 use iced::{Center, Element, Fill, Font, Length};
 
 use crate::app::{App, GitMessage, Message, RepoState, Selection, UiMessage};
-use crate::git::{ChangeKind, Diff, DiffLine, DiffLineKind, FileEntry};
+use crate::git::{ChangeKind, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo};
 
 /// The application's custom dark [`iced::Theme`].
 pub fn theme() -> iced::Theme {
@@ -60,24 +60,39 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         .height(Length::Fixed(30.0))
         .center(Length::Fixed(30.0));
 
+    // The brand's second line carries live repo context: the current branch and
+    // its sync state with the Remote.
     let brand = row![
         mark,
         column![
             text("Git Client").size(15).color(style::TEXT),
-            text("daily commit loop").size(11).color(style::TEXT_FAINT),
+            branch_summary(&app.repo.head),
         ]
-        .spacing(0),
+        .spacing(2),
     ]
     .spacing(11)
     .align_y(Center);
 
     // Repo-wide actions live together on the right: Refresh, then the remote
-    // operations. Push/Pull are disabled while one is already in flight. All
-    // share the exact pill style of the File List toolbar.
-    let busy = app.operation.is_some();
+    // operations. Push/Pull need a Remote and are disabled while one is already
+    // in flight; their labels carry the ahead/behind counts. All share the exact
+    // pill style of the File List toolbar.
+    let head = &app.repo.head;
+    let can_remote = head.has_remote && app.operation.is_none();
+    let push_label = if head.ahead > 0 {
+        format!("Push {}", head.ahead)
+    } else {
+        "Push".to_string()
+    };
+    let pull_label = if head.behind > 0 {
+        format!("Pull {}", head.behind)
+    } else {
+        "Pull".to_string()
+    };
+
     let refresh = pill("⟳", 17, "", GitMessage::Refresh, Tone::Normal, true);
-    let pull = pill("↓", 14, "Pull", GitMessage::Pull, Tone::Normal, !busy);
-    let push = pill("↑", 14, "Push", GitMessage::Push, Tone::Normal, !busy);
+    let pull = pill("↓", 14, &pull_label, GitMessage::Pull, Tone::Normal, can_remote);
+    let push = pill("↑", 14, &push_label, GitMessage::Push, Tone::Normal, can_remote);
 
     container(
         row![brand, space::horizontal(), refresh, pull, push]
@@ -88,6 +103,40 @@ fn top_bar(app: &App) -> Element<'_, Message> {
     .padding([10, 14])
     .width(Fill)
     .into()
+}
+
+/// The current branch and its sync state with the Remote, shown under the
+/// brand: "⎇ main  ↑2 ↓1", "✓ synced", "no upstream", or "detached HEAD".
+fn branch_summary(head: &HeadInfo) -> Element<'static, Message> {
+    let name = match &head.branch {
+        Some(branch) => format!("⎇ {branch}"),
+        None if head.detached => "detached HEAD".to_string(),
+        None => "no branch".to_string(),
+    };
+
+    let mut parts = row![text(name).size(11).color(style::TEXT_MUTED)]
+        .spacing(8)
+        .align_y(Center);
+
+    if head.upstream.is_some() {
+        if head.ahead > 0 {
+            parts = parts.push(text(format!("↑{}", head.ahead)).size(11).color(style::INFO));
+        }
+        if head.behind > 0 {
+            parts = parts.push(
+                text(format!("↓{}", head.behind))
+                    .size(11)
+                    .color(style::YELLOW),
+            );
+        }
+        if head.ahead == 0 && head.behind == 0 {
+            parts = parts.push(text("✓ synced").size(11).color(style::GREEN));
+        }
+    } else if head.branch.is_some() && head.has_remote {
+        parts = parts.push(text("no upstream").size(11).color(style::TEXT_FAINT));
+    }
+
+    parts.into()
 }
 
 // ── File List ────────────────────────────────────────────────────────────
@@ -495,7 +544,8 @@ fn commit_panel(app: &App) -> Element<'_, Message> {
 // ── Status Bar ───────────────────────────────────────────────────────────
 
 /// The persistent bottom strip: in-progress remote op, sticky error, or a
-/// transient success Notification — in that priority order.
+/// transient success Notification — in that priority order. When idle, it shows
+/// the last Commit as ambient context.
 fn status_bar(app: &App) -> Element<'_, Message> {
     let (icon, message, color) = if let Some(operation) = &app.operation {
         ("⟳", operation.clone(), style::INFO)
@@ -503,8 +553,14 @@ fn status_bar(app: &App) -> Element<'_, Message> {
         ("⚠", format!("{error}   ·   Esc to dismiss"), style::RED)
     } else if let Some(note) = &app.notification.message {
         ("✓", note.clone(), style::GREEN)
+    } else if let Some(commit) = &app.repo.head.last_commit {
+        (
+            "",
+            format!("{}  {}", commit.short_sha, commit.summary),
+            style::TEXT_FAINT,
+        )
     } else {
-        ("", "Ready".to_string(), style::TEXT_FAINT)
+        ("", "No commits yet".to_string(), style::TEXT_FAINT)
     };
 
     let content = row![text(icon).color(color), text(message).size(13).color(color)]

@@ -38,10 +38,12 @@ pub enum GitCommand {
 /// The result of a completed [`GitCommand`], sent from the Git Worker to the UI.
 #[derive(Debug, Clone)]
 pub enum GitEvent {
-    /// The current Working Tree and Staging Area contents.
+    /// The current Working Tree and Staging Area contents, plus the HEAD/branch
+    /// context — one consistent snapshot per refresh.
     StatusLoaded {
         unstaged: Vec<FileEntry>,
         staged: Vec<FileEntry>,
+        head: HeadInfo,
     },
     /// A freshly loaded Diff for the selected file.
     DiffLoaded(Diff),
@@ -53,6 +55,36 @@ pub enum GitEvent {
     Pulled,
     /// Any operation failed.
     Error(GitError),
+}
+
+/// The state of HEAD and its relationship to the Remote — what the UI needs to
+/// show the current branch, sync state, and last Commit. Built best-effort:
+/// missing pieces (no commits yet, no upstream, no remote) are `None`/zero
+/// rather than errors.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeadInfo {
+    /// The current branch's short name, or `None` when HEAD is detached or the
+    /// branch is unborn with no resolvable name.
+    pub branch: Option<String>,
+    /// HEAD points at a commit directly rather than a branch.
+    pub detached: bool,
+    /// An `origin` Remote is configured (gates Push/Pull).
+    pub has_remote: bool,
+    /// The configured upstream tracking branch, if any.
+    pub upstream: Option<String>,
+    /// Commits the local branch is ahead of its upstream.
+    pub ahead: usize,
+    /// Commits the local branch is behind its upstream.
+    pub behind: usize,
+    /// The Commit at HEAD, or `None` in a repository with no commits yet.
+    pub last_commit: Option<CommitSummary>,
+}
+
+/// A one-line summary of a Commit, for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSummary {
+    pub short_sha: String,
+    pub summary: String,
 }
 
 /// One entry in the File List: a path plus how it changed.
