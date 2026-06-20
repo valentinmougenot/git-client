@@ -4,9 +4,12 @@
 //! emit [`Message`]s. It never touches git2 directly — only the message types.
 //! All color and surface treatment lives in [`style`].
 
+mod highlight;
 mod style;
 
-use iced::widget::{button, checkbox, column, container, row, scrollable, space, text, text_input};
+use iced::widget::{
+    button, checkbox, column, container, rich_text, row, scrollable, space, span, text, text_input,
+};
 use iced::{Center, Element, Fill, Font, Length};
 
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
@@ -506,7 +509,21 @@ fn commit_detail_view(history: &HistoryState) -> Element<'_, Message> {
     .padding([10, 12])
     .width(Fill);
 
-    let rows: Vec<Element<Message>> = detail.lines.iter().map(diff_line).collect();
+    // The detail spans several files; track the current file (from the injected
+    // "● path" header lines) so each line is highlighted for its own language.
+    let mut lang = highlight::Lang::Plain;
+    let rows: Vec<Element<Message>> = detail
+        .lines
+        .iter()
+        .map(|line| {
+            if line.kind == DiffLineKind::Header
+                && let Some(path) = line.content.strip_prefix("● ")
+            {
+                lang = highlight::lang_for(path);
+            }
+            diff_line(line, lang)
+        })
+        .collect();
     let body = scrollable(column(rows).padding([8, 4])).height(Fill).width(Fill);
 
     column![header, body].spacing(10).padding(12).into()
@@ -550,7 +567,8 @@ fn diff_view(repo: &RepoState) -> Element<'_, Message> {
             .into();
     }
 
-    let rows: Vec<Element<Message>> = diff.lines.iter().map(diff_line).collect();
+    let lang = highlight::lang_for(&diff.path);
+    let rows: Vec<Element<Message>> = diff.lines.iter().map(|line| diff_line(line, lang)).collect();
     let body = scrollable(column(rows).padding([8, 4]))
         .height(Fill)
         .width(Fill);
@@ -600,13 +618,14 @@ fn diff_header(diff: &Diff) -> Element<'_, Message> {
 }
 
 /// One diff line: a two-column line-number gutter, a marker, and the content,
-/// over a full-width tint that conveys add/remove without tinting the text.
-fn diff_line(line: &DiffLine) -> Element<'_, Message> {
-    let (marker, marker_color, tint, content_color) = match line.kind {
-        DiffLineKind::Addition => ("+", style::GREEN, Some(style::GREEN_BG), style::TEXT),
-        DiffLineKind::Deletion => ("-", style::RED, Some(style::RED_BG), style::TEXT),
-        DiffLineKind::Context => (" ", style::TEXT_FAINT, None, style::TEXT_MUTED),
-        DiffLineKind::Header => ("", style::INFO, Some(style::INFO_BG), style::INFO),
+/// over a full-width tint that conveys add/remove without tinting the text. The
+/// content is syntax-highlighted (`lang`), except header lines which stay flat.
+fn diff_line<'a>(line: &'a DiffLine, lang: highlight::Lang) -> Element<'a, Message> {
+    let (marker, marker_color, tint) = match line.kind {
+        DiffLineKind::Addition => ("+", style::GREEN, Some(style::GREEN_BG)),
+        DiffLineKind::Deletion => ("-", style::RED, Some(style::RED_BG)),
+        DiffLineKind::Context => (" ", style::TEXT_FAINT, None),
+        DiffLineKind::Header => ("", style::INFO, Some(style::INFO_BG)),
     };
 
     let gutter = format!(
@@ -614,6 +633,22 @@ fn diff_line(line: &DiffLine) -> Element<'_, Message> {
         lineno(line.old_lineno),
         lineno(line.new_lineno)
     );
+
+    // Header lines (hunk and per-file markers) are shown flat; code lines get
+    // token coloring.
+    let content: Element<Message> = if matches!(line.kind, DiffLineKind::Header) {
+        text(line.content.clone())
+            .font(Font::MONOSPACE)
+            .size(13)
+            .color(style::INFO)
+            .into()
+    } else {
+        let spans: Vec<iced::widget::text::Span<()>> = highlight::spans(&line.content, lang)
+            .into_iter()
+            .map(|(fragment, color)| span(fragment).color(color))
+            .collect();
+        rich_text(spans).font(Font::MONOSPACE).size(13).into()
+    };
 
     container(
         row![
@@ -626,10 +661,7 @@ fn diff_line(line: &DiffLine) -> Element<'_, Message> {
                 .size(13)
                 .color(marker_color)
                 .width(Length::Fixed(10.0)),
-            text(line.content.clone())
-                .font(Font::MONOSPACE)
-                .size(13)
-                .color(content_color),
+            content,
         ]
         .spacing(10),
     )

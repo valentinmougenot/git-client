@@ -52,6 +52,17 @@ pub const INFO: Color = Color::from_rgb(0.20508, 0.62396, 1.0);
 /// Untracked / unstaged accents — amber (sRGB `#e0af68`).
 pub const YELLOW: Color = Color::from_rgb(0.74540, 0.42869, 0.13843);
 
+// Syntax-highlighting accents (used in the Diff View), Tokyo Night hues.
+/// Keywords — purple (sRGB `#bb9af7`).
+pub const SYN_KEYWORD: Color = Color::from_rgb(0.49693, 0.32314, 0.93011);
+/// Numbers — orange (sRGB `#ff9e64`).
+pub const SYN_NUMBER: Color = Color::from_rgb(1.0, 0.34191, 0.12744);
+/// Types / capitalized identifiers — cyan (sRGB `#2ac3de`).
+pub const SYN_TYPE: Color = Color::from_rgb(0.02315, 0.54572, 0.73046);
+/// Strings reuse the additions green; comments reuse the faint gutter color.
+pub const SYN_STRING: Color = GREEN;
+pub const SYN_COMMENT: Color = TEXT_FAINT;
+
 /// Full-row tint behind an added diff line.
 pub const GREEN_BG: Color = Color::from_rgba(0.34191, 0.61721, 0.14413, 0.12);
 /// Full-row tint behind a removed diff line.
