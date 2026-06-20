@@ -173,7 +173,10 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
                 Ok(()) => events.emit(GitEvent::Pulled),
                 Err(error) => events.emit(GitEvent::Error(error)),
             }
+            // A pull changes the branch tip and its ahead/behind, so refresh the
+            // branch list too — not just the status.
             emit_status(repo, events);
+            emit_branches(repo, events);
         }
         GitCommand::Fetch => {
             match fetch(repo) {

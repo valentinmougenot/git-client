@@ -145,7 +145,7 @@ fn top_bar(app: &App) -> Element<'_, Message> {
         "Pull".to_string()
     };
 
-    let refresh = pill("⟳", 17, "", GitMessage::Refresh, Tone::Normal, true);
+    let refresh = pill("⟳", 14, "", GitMessage::Refresh, Tone::Normal, true);
     let fetch = pill("↧", 14, "Fetch", GitMessage::Fetch, Tone::Normal, can_remote);
     let pull = pill("↓", 14, &pull_label, GitMessage::Pull, Tone::Normal, can_remote);
     let push = pill("↑", 14, &push_label, GitMessage::Push, Tone::Normal, can_remote);
