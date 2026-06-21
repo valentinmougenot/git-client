@@ -96,8 +96,18 @@ pub enum GitCommand {
     LoadStashDiff(usize),
     /// Merge the named branch into the current branch.
     Merge(String),
-    /// Resolve a conflicted file by taking one side, then stage it.
+    /// Resolve a whole conflicted file by taking one side, then stage it.
     ResolveConflict { path: String, side: ConflictSide },
+    /// Parse a conflicted file's Working Tree content into its conflict regions,
+    /// for region-by-region resolution.
+    LoadConflict(String),
+    /// Resolve one conflict region of a file (the `index`-th, in order) by taking
+    /// one side. When the file then has no markers left, it is staged.
+    ResolveHunk {
+        path: String,
+        index: usize,
+        side: ConflictSide,
+    },
     /// Abort an in-progress merge, restoring the pre-merge state.
     AbortMerge,
     /// Apply the stash at the given index without removing it.
@@ -169,8 +179,28 @@ pub enum GitEvent {
         branch: String,
         outcome: MergeOutcome,
     },
+    /// A conflicted file parsed into its regions, for region-by-region resolution.
+    ConflictLoaded(ConflictFile),
     /// Any operation failed.
     Error(GitError),
+}
+
+/// A conflicted file's Working Tree content, split into ordered segments so the
+/// UI can resolve each conflict region on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictFile {
+    pub path: String,
+    pub segments: Vec<ConflictSegment>,
+}
+
+/// One ordered piece of a [`ConflictFile`]: either agreed-upon context, or a
+/// conflict region with the two competing sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictSegment {
+    /// Lines outside any conflict (identical on both sides).
+    Context(Vec<String>),
+    /// One conflict region: our side (current branch) and their side (merged-in).
+    Conflict { ours: Vec<String>, theirs: Vec<String> },
 }
 
 /// How a merge resolved.

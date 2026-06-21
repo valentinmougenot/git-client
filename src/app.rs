@@ -14,9 +14,9 @@ use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Point, Subscription, Task};
 
 use crate::git::{
-    self, BranchInfo, CommitDetail, CommitInfo, ConflictSide, Diff, FileEntry, GitCommand, GitEvent,
-    CherryPickOutcome, HeadInfo, MergeOutcome, ResetKind, RevertOutcome, StashDiff, StashInfo,
-    TagInfo,
+    self, BranchInfo, CherryPickOutcome, CommitDetail, CommitInfo, ConflictFile, ConflictSide, Diff,
+    FileEntry, GitCommand, GitEvent, HeadInfo, MergeOutcome, ResetKind, RevertOutcome, StashDiff,
+    StashInfo, TagInfo,
 };
 use crate::ui;
 
@@ -160,6 +160,9 @@ pub struct RepoState {
     pub head: HeadInfo,
     pub selected: Option<Selection>,
     pub diff: Option<Diff>,
+    /// The selected conflicted file parsed into regions, for region-by-region
+    /// resolution. Set when a conflicted file is selected; cleared otherwise.
+    pub conflict: Option<ConflictFile>,
 }
 
 /// A file in the File List, identified by its path and which side it is on.
@@ -318,8 +321,14 @@ pub enum GitMessage {
     DeleteBranch(String),
     /// Merge the named branch into the current branch.
     Merge(String),
-    /// Resolve a conflicted file by taking one side (ours/theirs/both).
+    /// Resolve a whole conflicted file by taking one side (ours/theirs/both).
     ResolveConflict { path: String, side: ConflictSide },
+    /// Resolve one conflict region of a file by taking one side.
+    ResolveHunk {
+        path: String,
+        index: usize,
+        side: ConflictSide,
+    },
     /// Abort the in-progress merge, restoring the pre-merge state.
     AbortMerge,
     /// Delete all local branches absent from the Remote. First press arms a
@@ -580,6 +589,9 @@ impl App {
             GitMessage::ResolveConflict { path, side } => {
                 self.dispatch(GitCommand::ResolveConflict { path, side })
             }
+            GitMessage::ResolveHunk { path, index, side } => {
+                self.dispatch(GitCommand::ResolveHunk { path, index, side })
+            }
             GitMessage::AbortMerge => self.dispatch(GitCommand::AbortMerge),
             GitMessage::CreateBranch => {
                 let name = self.branches.new_name.trim().to_string();
@@ -724,6 +736,13 @@ impl App {
                 self.repo.head = head;
                 self.reconcile_selection();
                 self.prune_checked();
+                // With conflicts present and nothing selected, open the first one
+                // so the resolver is shown straight away.
+                if self.repo.selected.is_none()
+                    && let Some(first) = self.repo.conflicted.first()
+                {
+                    self.select(first.path.clone(), false);
+                }
             }
             GitEvent::DiffLoaded(diff) => {
                 // Discard a Diff that no longer matches the current selection
@@ -735,6 +754,17 @@ impl App {
                     .is_some_and(|s| s.path == diff.path && s.staged == diff.staged);
                 if matches {
                     self.repo.diff = Some(diff);
+                }
+            }
+            GitEvent::ConflictLoaded(file) => {
+                // Keep it only if it still matches the selected conflicted file.
+                let matches = self
+                    .repo
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| !s.staged && s.path == file.path);
+                if matches {
+                    self.repo.conflict = Some(file);
                 }
             }
             GitEvent::HistoryLoaded(commits) => {
@@ -900,13 +930,22 @@ impl App {
         }
     }
 
-    /// Select a file and request its Diff.
+    /// Select a file. A conflicted file loads its parsed regions (for region-by-
+    /// region resolution); any other file loads its Diff.
     fn select(&mut self, path: String, staged: bool) {
         self.repo.selected = Some(Selection {
             path: path.clone(),
             staged,
         });
-        self.dispatch(GitCommand::LoadDiff { path, staged });
+        let conflicted = !staged && self.repo.conflicted.iter().any(|e| e.path == path);
+        if conflicted {
+            self.repo.diff = None;
+            self.repo.conflict = None;
+            self.dispatch(GitCommand::LoadConflict(path));
+        } else {
+            self.repo.conflict = None;
+            self.dispatch(GitCommand::LoadDiff { path, staged });
+        }
     }
 
     /// Move selection through the flat list of Unstaged then Staged files.
@@ -1013,6 +1052,17 @@ impl App {
         if self.repo.selected.is_some() && !still_present {
             self.repo.selected = None;
             self.repo.diff = None;
+        }
+
+        // The conflict view only applies while the selected file is still
+        // conflicted; drop it once the file leaves the conflicted list.
+        let still_conflicted = self
+            .repo
+            .selected
+            .as_ref()
+            .is_some_and(|s| !s.staged && self.repo.conflicted.iter().any(|e| e.path == s.path));
+        if !still_conflicted {
+            self.repo.conflict = None;
         }
     }
 

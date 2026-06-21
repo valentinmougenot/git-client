@@ -22,8 +22,8 @@ use crate::app::{
     UiMessage, ViewMode,
 };
 use crate::git::{
-    BranchInfo, ChangeKind, CommitInfo, ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry,
-    HeadInfo, ResetKind, StashInfo, TagInfo,
+    BranchInfo, ChangeKind, CommitInfo, ConflictFile, ConflictSegment, ConflictSide, Diff, DiffLine,
+    DiffLineKind, FileEntry, HeadInfo, ResetKind, StashInfo, TagInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -48,7 +48,17 @@ pub fn root(app: &App) -> Element<'_, Message> {
 
     let right: Element<Message> = match app.view {
         ViewMode::Changes => {
-            let diff = container(diff_view(&app.repo))
+            // A selected conflicted file shows the region-by-region resolver;
+            // any other selection shows its diff.
+            let top: Element<Message> = match &app.repo.conflict {
+                Some(file)
+                    if app.repo.selected.as_ref().is_some_and(|s| s.path == file.path) =>
+                {
+                    conflict_view(file)
+                }
+                _ => diff_view(&app.repo),
+            };
+            let diff = container(top)
                 .style(style::panel)
                 .width(Fill)
                 .height(Fill);
@@ -780,8 +790,8 @@ fn conflicts_header<'a>(count: usize) -> Element<'a, Message> {
     .into()
 }
 
-/// One conflicted file: a click target to view it, plus one-click resolutions —
-/// keep ours, theirs, or both — that stage the result.
+/// One conflicted file: a click target that opens the region-by-region resolver
+/// in the right panel.
 fn conflict_row<'a>(app: &App, entry: &FileEntry) -> Element<'a, Message> {
     let path = entry.path.clone();
     let active = app.repo.selected.as_ref().is_some_and(|s| !s.staged && s.path == path);
@@ -800,24 +810,135 @@ fn conflict_row<'a>(app: &App, entry: &FileEntry) -> Element<'a, Message> {
         .padding([6, 8])
         .style(style::file_item(active));
 
-    let resolve = |label: &str, side: ConflictSide| {
+    name.into()
+}
+
+/// The region-by-region conflict resolver for the selected file: a header with
+/// whole-file shortcuts (Ours / Theirs / Both), then each conflict region with
+/// its own Ours / Theirs / Both, and the agreed context in between.
+fn conflict_view(file: &ConflictFile) -> Element<'_, Message> {
+    let path = file.path.clone();
+    let region_count = file
+        .segments
+        .iter()
+        .filter(|s| matches!(s, ConflictSegment::Conflict { .. }))
+        .count();
+
+    // Whole-file shortcut: resolve every region the same way at once.
+    let all = |label: &str, side: ConflictSide| {
         button(text(label.to_string()).size(11))
             .on_press(Message::Git(GitMessage::ResolveConflict {
                 path: path.clone(),
                 side,
             }))
-            .padding([3, 8])
+            .padding([3, 9])
+            .style(style::ghost)
+    };
+    let header = container(
+        row![
+            text(path.clone())
+                .size(13)
+                .font(Font::MONOSPACE)
+                .color(style::TEXT),
+            space::horizontal(),
+            text("Whole file:").size(11).color(style::TEXT_FAINT),
+            all("Ours", ConflictSide::Ours),
+            all("Theirs", ConflictSide::Theirs),
+            all("Both", ConflictSide::Both),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    )
+    .style(style::diff_header)
+    .padding([7, 12])
+    .width(Fill);
+
+    // Body: context blocks plus a card per conflict region (indexed in order).
+    let mut rows: Vec<Element<Message>> = Vec::new();
+    let mut region = 0;
+    for segment in &file.segments {
+        match segment {
+            ConflictSegment::Context(lines) => {
+                for line in lines {
+                    rows.push(conflict_line(line, style::TEXT_FAINT, None));
+                }
+            }
+            ConflictSegment::Conflict { ours, theirs } => {
+                rows.push(conflict_region(&path, region, region_count, ours, theirs));
+                region += 1;
+            }
+        }
+    }
+    let body = scrollable(column(rows).spacing(1).padding([8, 4]))
+        .height(Fill)
+        .width(Fill);
+
+    column![header, body].spacing(10).into()
+}
+
+/// One conflict region as a card: a labelled bar with per-region Ours / Theirs /
+/// Both, then the two sides tinted (ours green, theirs blue).
+fn conflict_region<'a>(
+    path: &str,
+    index: usize,
+    total: usize,
+    ours: &'a [String],
+    theirs: &'a [String],
+) -> Element<'a, Message> {
+    let pick = |label: &str, side: ConflictSide| {
+        button(text(label.to_string()).size(11))
+            .on_press(Message::Git(GitMessage::ResolveHunk {
+                path: path.to_string(),
+                index,
+                side,
+            }))
+            .padding([2, 8])
             .style(style::ghost)
     };
 
-    row![
-        name,
-        resolve("Ours", ConflictSide::Ours),
-        resolve("Theirs", ConflictSide::Theirs),
-        resolve("Both", ConflictSide::Both),
-    ]
-    .spacing(4)
-    .align_y(Center)
+    let bar = container(
+        row![
+            text(format!("Conflict {} of {}", index + 1, total))
+                .size(11)
+                .color(style::YELLOW),
+            space::horizontal(),
+            pick("Ours", ConflictSide::Ours),
+            pick("Theirs", ConflictSide::Theirs),
+            pick("Both", ConflictSide::Both),
+        ]
+        .spacing(6)
+        .align_y(Center),
+    )
+    .style(style::diff_row(Some(style::INFO_BG)))
+    .padding([3, 10])
+    .width(Fill);
+
+    let mut lines: Vec<Element<Message>> = vec![bar.into()];
+    for line in ours {
+        lines.push(conflict_line(line, style::GREEN, Some(style::GREEN_BG)));
+    }
+    for line in theirs {
+        lines.push(conflict_line(line, style::INFO, Some(style::INFO_BG)));
+    }
+    column(lines).into()
+}
+
+/// One rendered line inside the conflict view: monospace content over an optional
+/// full-width tint, with a colored side marker.
+fn conflict_line<'a>(
+    content: &str,
+    color: iced::Color,
+    tint: Option<iced::Color>,
+) -> Element<'a, Message> {
+    container(
+        text(content.to_string())
+            .font(Font::MONOSPACE)
+            .size(13)
+            .color(color),
+    )
+    .style(style::diff_row(tint))
+    .width(Fill)
+    .padding([1, 12])
     .into()
 }
 

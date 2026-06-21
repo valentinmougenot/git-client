@@ -272,6 +272,26 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_status(repo, events);
         }
+        GitCommand::LoadConflict(path) => match load_conflict(repo, &path) {
+            Ok(file) => events.emit(GitEvent::ConflictLoaded(file)),
+            Err(error) => events.emit(GitEvent::Error(error)),
+        },
+        GitCommand::ResolveHunk { path, index, side } => {
+            match resolve_hunk(repo, &path, index, side) {
+                Ok(resolved) => {
+                    // The file's conflict status (and the list) may have changed.
+                    emit_status(repo, events);
+                    // If regions remain, refresh the parsed view; if it is fully
+                    // resolved it has left the conflicted list, so nothing to show.
+                    if !resolved
+                        && let Ok(file) = load_conflict(repo, &path)
+                    {
+                        events.emit(GitEvent::ConflictLoaded(file));
+                    }
+                }
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+        }
         GitCommand::AbortMerge => {
             if let Err(error) = abort_merge(repo) {
                 events.emit(GitEvent::Error(error));
@@ -1592,6 +1612,161 @@ fn resolve_conflict(repo: &Repository, path: &str, side: ConflictSide) -> Result
     index.add_path(path_ref).map_err(|e| make(&e))?;
     index.write().map_err(|e| make(&e))?;
     Ok(())
+}
+
+/// Read a conflicted file's Working Tree content and parse its conflict markers
+/// into ordered segments for region-by-region resolution.
+fn load_conflict(repo: &Repository, path: &str) -> Result<ConflictFile, GitError> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::custom("load conflict", "no working directory"))?;
+    let content = std::fs::read_to_string(workdir.join(path))
+        .map_err(|error| GitError::custom("load conflict", error.to_string()))?;
+    Ok(ConflictFile {
+        path: path.to_string(),
+        segments: parse_conflict(&content),
+    })
+}
+
+/// Split a file's content into [`ConflictSegment`]s by its conflict markers.
+/// Understands both the default style and diff3 (the `|||||||` base block, which
+/// is skipped — only our and their sides are surfaced).
+fn parse_conflict(content: &str) -> Vec<ConflictSegment> {
+    let mut segments = Vec::new();
+    let mut context: Vec<String> = Vec::new();
+    // Which side we are currently accumulating inside a conflict region.
+    enum Side {
+        Ours,
+        Base,
+        Theirs,
+    }
+    let mut region: Option<(Vec<String>, Vec<String>, Side)> = None;
+
+    for line in content.lines() {
+        match &mut region {
+            None => {
+                if line.starts_with("<<<<<<<") {
+                    if !context.is_empty() {
+                        segments.push(ConflictSegment::Context(std::mem::take(&mut context)));
+                    }
+                    region = Some((Vec::new(), Vec::new(), Side::Ours));
+                } else {
+                    context.push(line.to_string());
+                }
+            }
+            Some((ours, theirs, side)) => {
+                if line.starts_with("|||||||") {
+                    *side = Side::Base;
+                } else if line.starts_with("=======") {
+                    *side = Side::Theirs;
+                } else if line.starts_with(">>>>>>>") {
+                    let (ours, theirs, _) = region.take().unwrap();
+                    segments.push(ConflictSegment::Conflict { ours, theirs });
+                } else {
+                    match side {
+                        Side::Ours => ours.push(line.to_string()),
+                        Side::Theirs => theirs.push(line.to_string()),
+                        // The base block (diff3) is not surfaced.
+                        Side::Base => {}
+                    }
+                }
+            }
+        }
+    }
+    if !context.is_empty() {
+        segments.push(ConflictSegment::Context(context));
+    }
+    segments
+}
+
+/// Resolve the `index`-th conflict region of `path` by taking one side, rewriting
+/// just that region in the Working Tree file. Returns whether the file is now
+/// fully resolved (no markers left) — in which case it is also staged.
+fn resolve_hunk(
+    repo: &Repository,
+    path: &str,
+    index: usize,
+    side: ConflictSide,
+) -> Result<bool, GitError> {
+    let make = |error: &git2::Error| GitError::new("resolve conflict", error);
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::custom("resolve conflict", "no working directory"))?
+        .to_path_buf();
+    let full = workdir.join(path);
+    let content = std::fs::read_to_string(&full)
+        .map_err(|error| GitError::custom("resolve conflict", error.to_string()))?;
+
+    // Rebuild the file, replacing the chosen region's marker block with the kept
+    // side and leaving every other region (and its markers) untouched.
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = 0;
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
+        if !line.starts_with("<<<<<<<") {
+            out.push(line.to_string());
+            continue;
+        }
+        // Collect this region's sides up to its closing marker.
+        let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+        let mut in_base = false;
+        let mut on_theirs = false;
+        for inner in lines.by_ref() {
+            if inner.starts_with("|||||||") {
+                in_base = true;
+            } else if inner.starts_with("=======") {
+                in_base = false;
+                on_theirs = true;
+            } else if inner.starts_with(">>>>>>>") {
+                break;
+            } else if in_base {
+                // diff3 base block: ignored.
+            } else if on_theirs {
+                theirs.push(inner.to_string());
+            } else {
+                ours.push(inner.to_string());
+            }
+        }
+
+        if seen == index {
+            // Replace just this region with the chosen side.
+            match side {
+                ConflictSide::Ours => out.extend(ours),
+                ConflictSide::Theirs => out.extend(theirs),
+                ConflictSide::Both => {
+                    out.extend(ours);
+                    out.extend(theirs);
+                }
+            }
+        } else {
+            // Keep this region conflicted, markers and all.
+            out.push("<<<<<<< HEAD".to_string());
+            out.extend(ours);
+            out.push("=======".to_string());
+            out.extend(theirs);
+            out.push(">>>>>>> incoming".to_string());
+        }
+        seen += 1;
+    }
+
+    // Preserve a trailing newline if the original had one.
+    let mut text = out.join("\n");
+    if content.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(&full, &text)
+        .map_err(|error| GitError::custom("resolve conflict", error.to_string()))?;
+
+    // If no conflict markers remain, the file is resolved: stage it.
+    let resolved = !text.contains("<<<<<<<");
+    if resolved {
+        let mut index = repo.index().map_err(|e| make(&e))?;
+        let path_ref = Path::new(path);
+        let _ = index.conflict_remove(path_ref);
+        index.add_path(path_ref).map_err(|e| make(&e))?;
+        index.write().map_err(|e| make(&e))?;
+    }
+    Ok(resolved)
 }
 
 /// Abort an in-progress merge: discard the half-merged Working Tree and index by
@@ -3092,6 +3267,113 @@ mod tests {
 
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "master\n");
+        assert!(events.last_conflicted().is_empty());
+    }
+
+    /// The most recent `ConflictLoaded` payload.
+    fn last_conflict(events: &Collector) -> ConflictFile {
+        events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::ConflictLoaded(file) => Some(file),
+                _ => None,
+            })
+            .expect("expected a ConflictLoaded event")
+    }
+
+    #[test]
+    fn load_conflict_parses_a_files_regions() {
+        let (_dir, repo, events) = conflicted_repo();
+
+        process(&repo, GitCommand::LoadConflict("a.txt".into()), &events);
+
+        let file = last_conflict(&events);
+        let regions: Vec<&ConflictSegment> = file
+            .segments
+            .iter()
+            .filter(|s| matches!(s, ConflictSegment::Conflict { .. }))
+            .collect();
+        assert_eq!(regions.len(), 1);
+        let ConflictSegment::Conflict { ours, theirs } = regions[0] else {
+            unreachable!()
+        };
+        // ours is the current branch (master), theirs the merged-in (feature).
+        assert_eq!(ours, &["master"]);
+        assert_eq!(theirs, &["feature"]);
+    }
+
+    #[test]
+    fn resolve_hunk_resolves_one_region_and_stages_when_no_markers_remain() {
+        let (dir, repo, events) = conflicted_repo();
+
+        process(
+            &repo,
+            GitCommand::ResolveHunk {
+                path: "a.txt".into(),
+                index: 0,
+                side: ConflictSide::Theirs,
+            },
+            &events,
+        );
+
+        // Single region taken from theirs; file has no markers and is staged.
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "feature\n");
+        assert!(events.last_conflicted().is_empty());
+        let (_unstaged, staged) = events.last_status();
+        assert_eq!(paths(&staged), ["a.txt"]);
+    }
+
+    #[test]
+    fn resolve_hunk_handles_one_region_at_a_time_in_a_multi_conflict_file() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        // A file whose first and last lines both conflict, with enough stable
+        // middle (> the 3-line diff context) to split into two regions.
+        let mid = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        commit_file(dir.path(), &repo, &events, "f.txt", &format!("a\n{mid}z\n"));
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "f.txt", &format!("A\n{mid}Z\n"));
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+        commit_file(dir.path(), &repo, &events, "f.txt", &format!("A2\n{mid}Z2\n"));
+        process(&repo, GitCommand::Merge("feature".into()), &events);
+
+        // Two distinct conflict regions, separated by the shared middle.
+        process(&repo, GitCommand::LoadConflict("f.txt".into()), &events);
+        let regions = last_conflict(&events)
+            .segments
+            .iter()
+            .filter(|s| matches!(s, ConflictSegment::Conflict { .. }))
+            .count();
+        assert_eq!(regions, 2);
+
+        // Take ours for the first region; the file stays conflicted (one left).
+        process(
+            &repo,
+            GitCommand::ResolveHunk {
+                path: "f.txt".into(),
+                index: 0,
+                side: ConflictSide::Ours,
+            },
+            &events,
+        );
+        assert_eq!(paths(&events.last_conflicted()), ["f.txt"]);
+
+        // The remaining region is now index 0; take theirs to finish.
+        process(
+            &repo,
+            GitCommand::ResolveHunk {
+                path: "f.txt".into(),
+                index: 0,
+                side: ConflictSide::Theirs,
+            },
+            &events,
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            format!("A2\n{mid}Z\n")
+        );
         assert!(events.last_conflicted().is_empty());
     }
 }
