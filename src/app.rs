@@ -129,6 +129,9 @@ pub struct CommitState {
     pub message: String,
     pub committing: bool,
     pub amend: bool,
+    /// Whether the in-flight Commit should be followed by a Push once it lands.
+    /// Set by the "Commit & Push" action, consumed when the Commit completes.
+    pub push_after_commit: bool,
 }
 
 /// The last error or warning; sticky until dismissed.
@@ -228,6 +231,8 @@ pub enum GitMessage {
     /// the app) and reload the active Diff.
     Refresh,
     Commit,
+    /// Commit the staged changes, then Push once the Commit lands.
+    CommitAndPush,
     /// Switch to the named local branch.
     Checkout(String),
     /// Create a local branch from the in-progress name and switch to it.
@@ -425,7 +430,8 @@ impl App {
             GitMessage::UnstageHunk { path, hunk } => {
                 self.dispatch(GitCommand::UnstageHunk { path, hunk });
             }
-            GitMessage::Commit => self.start_commit(),
+            GitMessage::Commit => self.start_commit(false),
+            GitMessage::CommitAndPush => self.start_commit(true),
             GitMessage::Checkout(name) => self.dispatch(GitCommand::Checkout(name)),
             GitMessage::CreateBranch => {
                 let name = self.branches.new_name.trim().to_string();
@@ -569,6 +575,10 @@ impl App {
                 self.notify(format!("Committed {sha}"));
                 // A new (or amended) Commit changes history; keep it current.
                 self.dispatch(GitCommand::LoadHistory);
+                // "Commit & Push" chains a Push once the Commit has landed.
+                if std::mem::take(&mut self.commit.push_after_commit) {
+                    self.start_remote("Pushing…", GitCommand::Push);
+                }
             }
             GitEvent::BranchesLoaded(branches) => {
                 self.branches.branches = branches;
@@ -608,6 +618,8 @@ impl App {
             }
             GitEvent::Error(error) => {
                 self.commit.committing = false;
+                // A failed Commit must not trigger the queued Push.
+                self.commit.push_after_commit = false;
                 self.operation = None;
                 self.status.message = Some(error.to_string());
             }
@@ -671,7 +683,9 @@ impl App {
         }
     }
 
-    fn start_commit(&mut self) {
+    /// Begin a Commit (or Amend). When `then_push` is set, the Commit will be
+    /// followed by a Push once it lands (see the `Committed` event handler).
+    fn start_commit(&mut self, then_push: bool) {
         let message = self.commit.message.trim().to_string();
         if message.is_empty() {
             self.status.message = Some("Cannot commit: the message is empty".to_string());
@@ -686,6 +700,7 @@ impl App {
                 return;
             }
             self.commit.committing = true;
+            self.commit.push_after_commit = then_push;
             self.dispatch(GitCommand::Amend(message));
             return;
         }
@@ -695,6 +710,7 @@ impl App {
             return;
         }
         self.commit.committing = true;
+        self.commit.push_after_commit = then_push;
         self.dispatch(GitCommand::Commit(message));
     }
 
@@ -987,6 +1003,60 @@ mod tests {
             app.notification.message.as_deref(),
             Some("Committed abc1234")
         );
+    }
+
+    #[test]
+    fn commit_and_push_arms_the_push_then_fires_it_when_the_commit_lands() {
+        let mut app = App::new();
+        app.repo.staged = vec![entry("a.txt", ChangeKind::Added)];
+        app.repo.head.has_remote = true;
+        app.commit.message = "ship it".to_string();
+
+        // The combined action commits and queues a Push.
+        update(&mut app, Message::Git(GitMessage::CommitAndPush));
+        assert!(app.commit.committing);
+        assert!(app.commit.push_after_commit);
+
+        // When the Commit lands, the Push starts and the flag is consumed.
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::Committed("abc1234".to_string())),
+        );
+        assert!(!app.commit.push_after_commit);
+        assert_eq!(app.operation.as_deref(), Some("Pushing…"));
+    }
+
+    #[test]
+    fn a_plain_commit_does_not_queue_a_push() {
+        let mut app = App::new();
+        app.repo.staged = vec![entry("a.txt", ChangeKind::Added)];
+        app.commit.message = "just commit".to_string();
+
+        update(&mut app, Message::Git(GitMessage::Commit));
+        assert!(!app.commit.push_after_commit);
+
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::Committed("abc1234".to_string())),
+        );
+        assert!(app.operation.is_none());
+    }
+
+    #[test]
+    fn a_failed_commit_clears_a_queued_push() {
+        let mut app = App::new();
+        app.commit.committing = true;
+        app.commit.push_after_commit = true;
+
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::Error(crate::git::GitError::custom(
+                "commit", "boom",
+            ))),
+        );
+
+        assert!(!app.commit.push_after_commit);
+        assert!(app.operation.is_none());
     }
 
     #[test]

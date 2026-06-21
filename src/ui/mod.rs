@@ -1339,6 +1339,14 @@ fn commit_panel(app: &App) -> Element<'_, Message> {
         .padding([8, 18])
         .style(style::primary);
 
+    // "Commit & Push" chains a Push after the Commit lands; it needs the same
+    // staged/message readiness plus a remote to push to and no busy operation.
+    let can_push = app.repo.head.has_remote && app.operation.is_none();
+    let commit_push_button = button(text("Commit & Push").size(14))
+        .on_press_maybe((ready && can_push).then_some(Message::Git(GitMessage::CommitAndPush)))
+        .padding([8, 14])
+        .style(style::secondary);
+
     // The Amend toggle is only meaningful once there is a Commit to amend.
     let amend_toggle = checkbox(commit.amend)
         .on_toggle_maybe(has_commit.then_some(|_| Message::Ui(UiMessage::ToggleAmend)))
@@ -1370,6 +1378,7 @@ fn commit_panel(app: &App) -> Element<'_, Message> {
 
     let footer = row![
         commit_button,
+        commit_push_button,
         amend,
         text(summary).size(12).color(summary_color),
         space::horizontal(),
