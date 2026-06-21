@@ -1,62 +1,67 @@
-//! Builds a directory tree out of the flat File List for the Diff sidebar.
+//! Builds a directory tree out of a flat list of slash-separated paths.
 //!
-//! Git reports changes as a flat list of slash-separated paths. This groups them
-//! into a hierarchy of directory nodes and file leaves so the UI can render a
-//! collapsible tree. Directory chains with a single child are compressed into
+//! Both the File List (paths like `src/ui/mod.rs`) and the Branches list (names
+//! like `feature/login`) are flat lists that read better as a hierarchy. This
+//! groups them into directory nodes and leaves, generic over the leaf type via a
+//! `path_of` accessor. Directory chains with a single child are compressed into
 //! one node (`src/ui` rather than `src` ▸ `ui`), the way most editors show them.
 
-use crate::git::FileEntry;
-
-/// A node in the File Tree: either a directory holding more nodes, or a file.
-pub enum Node<'a> {
+/// A node in the tree: either a directory holding more nodes, or a leaf `T`
+/// (a file entry, a branch, …).
+pub enum Node<'a, T> {
     Dir {
         /// The segment to display, e.g. `ui` — or `ui/widget` when a
         /// single-child chain was compressed.
         name: String,
-        /// The full path from the repo root to this directory, used as the
-        /// collapse key.
+        /// The full path from the root to this directory, used as the collapse
+        /// key.
         path: String,
-        children: Vec<Node<'a>>,
+        children: Vec<Node<'a, T>>,
     },
-    File(&'a FileEntry),
+    Leaf(&'a T),
 }
 
-/// Group a flat list of entries into a directory tree. Directories come before
-/// files at each level; within each kind the input order is preserved.
-pub fn build(entries: &[FileEntry]) -> Vec<Node<'_>> {
-    let items: Vec<(&FileEntry, Vec<&str>)> = entries
+/// Group a flat list of entries into a tree, splitting each entry's path (from
+/// `path_of`) on `/`. Directories come before leaves at each level; within each
+/// kind the input order is preserved.
+pub fn build<'a, T>(entries: &'a [T], path_of: impl Fn(&'a T) -> &'a str) -> Vec<Node<'a, T>> {
+    let items: Vec<(&'a T, Vec<&'a str>)> = entries
         .iter()
-        .map(|entry| (entry, entry.path.split('/').collect()))
+        .map(|entry| (entry, path_of(entry).split('/').collect()))
         .collect();
     build_level(&items, "")
 }
 
-/// The paths of every file leaf under a list of nodes, depth-first. Used for a
-/// directory's "select all" checkbox and its file count (`.len()`).
-pub fn file_paths(nodes: &[Node<'_>]) -> Vec<String> {
+/// The paths of every leaf under a list of nodes, depth-first. Used for a
+/// directory's "select all" checkbox and its leaf count (`.len()`).
+pub fn leaf_paths<'a, T>(nodes: &[Node<'a, T>], path_of: impl Fn(&'a T) -> &'a str) -> Vec<String> {
     let mut out = Vec::new();
-    collect_paths(nodes, &mut out);
+    collect_paths(nodes, &path_of, &mut out);
     out
 }
 
-fn collect_paths(nodes: &[Node<'_>], out: &mut Vec<String>) {
+fn collect_paths<'a, T>(
+    nodes: &[Node<'a, T>],
+    path_of: &impl Fn(&'a T) -> &'a str,
+    out: &mut Vec<String>,
+) {
     for node in nodes {
         match node {
-            Node::File(entry) => out.push(entry.path.clone()),
-            Node::Dir { children, .. } => collect_paths(children, out),
+            Node::Leaf(entry) => out.push(path_of(entry).to_string()),
+            Node::Dir { children, .. } => collect_paths(children, path_of, out),
         }
     }
 }
 
-fn build_level<'a>(items: &[(&'a FileEntry, Vec<&'a str>)], prefix: &str) -> Vec<Node<'a>> {
-    // Directory buckets, kept in first-seen order; files at this level held aside
-    // so they render after the directories.
-    let mut dirs: Vec<(String, Vec<(&'a FileEntry, Vec<&'a str>)>)> = Vec::new();
-    let mut files: Vec<Node<'a>> = Vec::new();
+fn build_level<'a, T>(items: &[(&'a T, Vec<&'a str>)], prefix: &str) -> Vec<Node<'a, T>> {
+    // Directory buckets, kept in first-seen order; leaves at this level held
+    // aside so they render after the directories.
+    let mut dirs: Vec<(String, Vec<(&'a T, Vec<&'a str>)>)> = Vec::new();
+    let mut leaves: Vec<Node<'a, T>> = Vec::new();
 
     for (entry, segments) in items {
         if segments.len() <= 1 {
-            files.push(Node::File(entry));
+            leaves.push(Node::Leaf(entry));
             continue;
         }
         let head = segments[0];
@@ -67,7 +72,7 @@ fn build_level<'a>(items: &[(&'a FileEntry, Vec<&'a str>)], prefix: &str) -> Vec
         }
     }
 
-    let mut out = Vec::with_capacity(dirs.len() + files.len());
+    let mut out = Vec::with_capacity(dirs.len() + leaves.len());
     for (name, group) in dirs {
         let path = if prefix.is_empty() {
             name.clone()
@@ -77,13 +82,13 @@ fn build_level<'a>(items: &[(&'a FileEntry, Vec<&'a str>)], prefix: &str) -> Vec
         let children = build_level(&group, &path);
         out.push(compress(name, path, children));
     }
-    out.extend(files);
+    out.extend(leaves);
     out
 }
 
-/// Collapse a directory that holds exactly one subdirectory (and no files) into
+/// Collapse a directory that holds exactly one subdirectory (and no leaves) into
 /// a single node, recursively, so long single-child chains read as one row.
-fn compress<'a>(name: String, path: String, mut children: Vec<Node<'a>>) -> Node<'a> {
+fn compress<'a, T>(name: String, path: String, mut children: Vec<Node<'a, T>>) -> Node<'a, T> {
     if children.len() == 1 && matches!(children[0], Node::Dir { .. }) {
         if let Node::Dir {
             name: child_name,
@@ -104,7 +109,7 @@ fn compress<'a>(name: String, path: String, mut children: Vec<Node<'a>>) -> Node
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::ChangeKind;
+    use crate::git::{ChangeKind, FileEntry};
 
     fn entry(path: &str) -> FileEntry {
         FileEntry {
@@ -113,23 +118,27 @@ mod tests {
         }
     }
 
+    fn path_of(entry: &FileEntry) -> &str {
+        entry.path.as_str()
+    }
+
     /// A flat description of the tree for assertions: one `"depth name"` line per
     /// node, depth-first, directories before files.
-    fn flatten(nodes: &[Node<'_>], depth: usize, out: &mut Vec<String>) {
+    fn flatten(nodes: &[Node<'_, FileEntry>], depth: usize, out: &mut Vec<String>) {
         for node in nodes {
             match node {
                 Node::Dir { name, children, .. } => {
                     out.push(format!("{depth} {name}/"));
                     flatten(children, depth + 1, out);
                 }
-                Node::File(e) => out.push(format!("{depth} {}", e.path.rsplit('/').next().unwrap())),
+                Node::Leaf(e) => out.push(format!("{depth} {}", e.path.rsplit('/').next().unwrap())),
             }
         }
     }
 
     fn render(entries: &[FileEntry]) -> Vec<String> {
         let mut out = Vec::new();
-        flatten(&build(entries), 0, &mut out);
+        flatten(&build(entries, path_of), 0, &mut out);
         out
     }
 
@@ -176,7 +185,7 @@ mod tests {
     #[test]
     fn directory_path_is_the_full_prefix() {
         let entries = [entry("src/ui/mod.rs")];
-        let nodes = build(&entries);
+        let nodes = build(&entries, path_of);
         // Compressed to `src/ui`, with the full path as its collapse key.
         match &nodes[0] {
             Node::Dir { name, path, .. } => {
@@ -193,7 +202,7 @@ mod tests {
         // Depth-first, mirroring the rendered order: subdirectories before
         // files at each level.
         assert_eq!(
-            file_paths(&build(&entries)),
+            leaf_paths(&build(&entries, path_of), path_of),
             vec![
                 "src/sub/b.rs".to_string(),
                 "src/a.rs".to_string(),

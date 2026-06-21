@@ -115,6 +115,13 @@ fn dir_key(staged: bool, path: &str) -> String {
     format!("{}\u{1}{path}", if staged { 's' } else { 'u' })
 }
 
+/// The key under which a Branch Tree folder's collapsed state is stored. The
+/// `b` namespace and the section prefix keep it distinct from File Tree keys and
+/// from the matching path on the other section.
+fn branch_dir_key(remote: bool, path: &str) -> String {
+    format!("b{}\u{1}{path}", if remote { 'r' } else { 'l' })
+}
+
 /// In-progress commit message, whether a Commit is running, and whether the
 /// next Commit amends HEAD instead of creating a new Commit.
 #[derive(Default)]
@@ -173,6 +180,11 @@ pub enum UiMessage {
     /// Collapse or expand a directory node in the File Tree.
     ToggleDir {
         staged: bool,
+        path: String,
+    },
+    /// Collapse or expand a folder node in the Branch Tree.
+    ToggleBranchDir {
+        remote: bool,
         path: String,
     },
     /// Check or uncheck every file under a directory node, given its descendant
@@ -256,6 +268,12 @@ impl App {
         self.collapsed.contains(&dir_key(staged, path))
     }
 
+    /// Whether a Branch Tree folder is collapsed. `remote` separates the LOCAL
+    /// and REMOTE sections so the same path can differ between them.
+    pub fn branch_dir_collapsed(&self, remote: bool, path: &str) -> bool {
+        self.collapsed.contains(&branch_dir_key(remote, path))
+    }
+
     /// Send a command to the Git Worker, if it has booted.
     fn dispatch(&self, command: GitCommand) {
         if let Some(commands) = &self.commands {
@@ -281,6 +299,12 @@ impl App {
             UiMessage::ToggleSection { staged } => self.toggle_section(staged),
             UiMessage::ToggleDir { staged, path } => {
                 let key = dir_key(staged, &path);
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+            }
+            UiMessage::ToggleBranchDir { remote, path } => {
+                let key = branch_dir_key(remote, &path);
                 if !self.collapsed.remove(&key) {
                     self.collapsed.insert(key);
                 }

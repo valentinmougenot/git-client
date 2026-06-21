@@ -233,27 +233,27 @@ fn push_tree<'a>(
     staged: bool,
     items: &mut Vec<Element<'a, Message>>,
 ) {
-    for node in tree::build(entries) {
+    for node in tree::build(entries, |entry| entry.path.as_str()) {
         push_node(app, node, staged, 0, items);
     }
 }
 
 fn push_node<'a>(
     app: &'a App,
-    node: tree::Node<'a>,
+    node: tree::Node<'a, FileEntry>,
     staged: bool,
     depth: usize,
     items: &mut Vec<Element<'a, Message>>,
 ) {
     match node {
-        tree::Node::File(entry) => items.push(file_row(app, entry, staged, depth)),
+        tree::Node::Leaf(entry) => items.push(file_row(app, entry, staged, depth)),
         tree::Node::Dir {
             name,
             path,
             children,
         } => {
             let collapsed = app.dir_collapsed(staged, &path);
-            let paths = tree::file_paths(&children);
+            let paths = tree::leaf_paths(&children, |entry| entry.path.as_str());
             let all_checked = paths.iter().all(|p| {
                 app.checked.contains(&Selection {
                     path: p.clone(),
@@ -713,17 +713,13 @@ fn branches_list(app: &App) -> Element<'_, Message> {
     if locals.is_empty() {
         items.push(placeholder("No branches yet"));
     } else {
-        for branch in locals {
-            items.push(branch_row(branch, armed == Some(branch.name.as_str())));
-        }
+        push_branch_tree(app, &locals, false, armed, &mut items);
     }
 
     if !remotes.is_empty() {
         items.push(gap(10.0));
         items.push(branch_section_label("REMOTE", remotes.len()));
-        for branch in remotes {
-            items.push(branch_row(branch, false));
-        }
+        push_branch_tree(app, &remotes, true, None, &mut items);
     }
 
     scrollable(column(items).spacing(4).padding(12))
@@ -763,10 +759,101 @@ fn local_header<'a>(count: usize, prunable: usize, armed: bool) -> Element<'a, M
     container(header).width(Fill).into()
 }
 
-/// One branch: a current-branch marker, its name, its sync state, and — for any
-/// branch other than the current one — a click target to switch to it and a
-/// delete button.
-fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
+/// Render a section's branches as a collapsible folder tree, splitting each name
+/// on `/` (e.g. `feature/login`). Remote names have their remote prefix
+/// (`origin/`) stripped, since the REMOTE heading already conveys it.
+fn push_branch_tree<'a>(
+    app: &'a App,
+    branches: &[&'a BranchInfo],
+    remote: bool,
+    armed: Option<&'a str>,
+    items: &mut Vec<Element<'a, Message>>,
+) {
+    let path_of = |branch: &&'a BranchInfo| -> &str {
+        let name = branch.name.as_str();
+        if remote {
+            name.split_once('/').map_or(name, |(_, rest)| rest)
+        } else {
+            name
+        }
+    };
+    for node in tree::build(branches, path_of) {
+        push_branch_node(app, node, remote, 0, armed, items);
+    }
+}
+
+fn push_branch_node<'a>(
+    app: &'a App,
+    node: tree::Node<'_, &'a BranchInfo>,
+    remote: bool,
+    depth: usize,
+    armed: Option<&str>,
+    items: &mut Vec<Element<'a, Message>>,
+) {
+    match node {
+        tree::Node::Leaf(branch) => {
+            let branch: &'a BranchInfo = branch;
+            items.push(branch_row(branch, armed == Some(branch.name.as_str()), depth));
+        }
+        tree::Node::Dir {
+            name,
+            path,
+            children,
+        } => {
+            let collapsed = app.branch_dir_collapsed(remote, &path);
+            items.push(branch_dir_row(&name, &path, remote, depth, collapsed));
+            if !collapsed {
+                for child in children {
+                    push_branch_node(app, child, remote, depth + 1, armed, items);
+                }
+            }
+        }
+    }
+}
+
+/// One folder in the Branch Tree: an indented, clickable row (chevron + folder
+/// name) that collapses or expands the branches grouped under it.
+fn branch_dir_row<'a>(
+    name: &str,
+    path: &str,
+    remote: bool,
+    depth: usize,
+    collapsed: bool,
+) -> Element<'a, Message> {
+    let chevron = container(
+        text(if collapsed { "▸" } else { "▾" })
+            .size(10)
+            .color(style::TEXT_FAINT),
+    )
+    .width(Length::Fixed(16.0))
+    .center_x(Length::Fixed(16.0));
+
+    let toggle = button(
+        row![
+            chevron,
+            text(name.to_string()).size(14).color(style::TEXT_MUTED),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    )
+    .on_press(Message::Ui(UiMessage::ToggleBranchDir {
+        remote,
+        path: path.to_string(),
+    }))
+    .width(Fill)
+    .padding([6, 8])
+    .style(style::file_item(false));
+
+    row![tree_indent(depth), toggle]
+        .spacing(8)
+        .align_y(Center)
+        .into()
+}
+
+/// One branch leaf: a current-branch marker, its (leaf) name, its sync state,
+/// and — for any branch other than the current one — a click target to switch to
+/// it and a delete button.
+fn branch_row<'a>(branch: &BranchInfo, armed: bool, depth: usize) -> Element<'a, Message> {
     let bar = container(text(""))
         .width(Length::Fixed(3.0))
         .height(Length::Fixed(16.0))
@@ -783,10 +870,12 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
         style::TEXT_MUTED
     };
 
+    // Show only the leaf segment; the folder rows above convey the path.
+    let leaf = branch.name.rsplit('/').next().unwrap_or(&branch.name).to_string();
     let mut label = row![
         bar,
         text("⎇").size(13).color(icon_color),
-        text(branch.name.clone()).size(14).color(name_color),
+        text(leaf).size(14).color(name_color),
     ]
     .spacing(10)
     .align_y(Center);
@@ -816,7 +905,10 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
 
     // The current branch and remote branches have no in-row delete.
     if branch.is_head || branch.is_remote {
-        return select.into();
+        return row![tree_indent(depth), select]
+            .spacing(8)
+            .align_y(Center)
+            .into();
     }
 
     // A quiet, borderless delete sitting inside the row's rectangle, right-
@@ -833,7 +925,10 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool) -> Element<'a, Message> {
         .center_y(Fill)
         .padding([0, 6]);
 
-    stack![select, delete].into()
+    row![tree_indent(depth), stack![select, delete]]
+        .spacing(8)
+        .align_y(Center)
+        .into()
 }
 
 /// The right panel in the Branches view: a short summary of the current branch
