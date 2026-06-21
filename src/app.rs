@@ -14,8 +14,8 @@ use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Subscription, Task};
 
 use crate::git::{
-    self, BranchInfo, CommitDetail, CommitInfo, Diff, FileEntry, GitCommand, GitEvent, HeadInfo,
-    MergeOutcome, StashDiff, StashInfo,
+    self, BranchInfo, CommitDetail, CommitInfo, ConflictSide, Diff, FileEntry, GitCommand, GitEvent,
+    HeadInfo, MergeOutcome, StashDiff, StashInfo,
 };
 use crate::ui;
 
@@ -113,6 +113,8 @@ pub struct StashesState {
 pub struct RepoState {
     pub unstaged: Vec<FileEntry>,
     pub staged: Vec<FileEntry>,
+    /// Files left in conflict by an in-progress merge, awaiting resolution.
+    pub conflicted: Vec<FileEntry>,
     /// Current branch, sync state with the Remote, and last Commit.
     pub head: HeadInfo,
     pub selected: Option<Selection>,
@@ -264,6 +266,10 @@ pub enum GitMessage {
     DeleteBranch(String),
     /// Merge the named branch into the current branch.
     Merge(String),
+    /// Resolve a conflicted file by taking one side (ours/theirs/both).
+    ResolveConflict { path: String, side: ConflictSide },
+    /// Abort the in-progress merge, restoring the pre-merge state.
+    AbortMerge,
     /// Delete all local branches absent from the Remote. First press arms a
     /// confirmation; the second performs it.
     PruneBranches,
@@ -485,6 +491,10 @@ impl App {
             GitMessage::CommitAndPush => self.start_commit(true),
             GitMessage::Checkout(name) => self.dispatch(GitCommand::Checkout(name)),
             GitMessage::Merge(name) => self.dispatch(GitCommand::Merge(name)),
+            GitMessage::ResolveConflict { path, side } => {
+                self.dispatch(GitCommand::ResolveConflict { path, side })
+            }
+            GitMessage::AbortMerge => self.dispatch(GitCommand::AbortMerge),
             GitMessage::CreateBranch => {
                 let name = self.branches.new_name.trim().to_string();
                 if !name.is_empty() {
@@ -613,10 +623,12 @@ impl App {
             GitEvent::StatusLoaded {
                 unstaged,
                 staged,
+                conflicted,
                 head,
             } => {
                 self.repo.unstaged = unstaged;
                 self.repo.staged = staged;
+                self.repo.conflicted = conflicted;
                 self.repo.head = head;
                 self.reconcile_selection();
                 self.prune_checked();
@@ -819,6 +831,11 @@ impl App {
             self.status.message = Some("Cannot commit: the message is empty".to_string());
             return;
         }
+        if !self.repo.conflicted.is_empty() {
+            self.status.message =
+                Some("Cannot commit: resolve the merge conflicts first".to_string());
+            return;
+        }
 
         // Amend replaces HEAD, so it needs a Commit to amend but not staged
         // changes (amending only the message is valid).
@@ -850,12 +867,13 @@ impl App {
     /// Drop the selection and Diff if the selected file is gone after a refresh.
     fn reconcile_selection(&mut self) {
         let still_present = self.repo.selected.as_ref().is_some_and(|selection| {
-            let list = if selection.staged {
-                &self.repo.staged
+            // A working-tree selection may be an unstaged or a conflicted file.
+            let in_list = |list: &[FileEntry]| list.iter().any(|e| e.path == selection.path);
+            if selection.staged {
+                in_list(&self.repo.staged)
             } else {
-                &self.repo.unstaged
-            };
-            list.iter().any(|entry| entry.path == selection.path)
+                in_list(&self.repo.unstaged) || in_list(&self.repo.conflicted)
+            }
         });
 
         if self.repo.selected.is_some() && !still_present {
@@ -1020,6 +1038,7 @@ mod tests {
         Message::GitEvent(GitEvent::StatusLoaded {
             unstaged,
             staged,
+            conflicted: Vec::new(),
             head: HeadInfo::default(),
         })
     }

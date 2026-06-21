@@ -73,6 +73,10 @@ pub enum GitCommand {
     LoadStashDiff(usize),
     /// Merge the named branch into the current branch.
     Merge(String),
+    /// Resolve a conflicted file by taking one side, then stage it.
+    ResolveConflict { path: String, side: ConflictSide },
+    /// Abort an in-progress merge, restoring the pre-merge state.
+    AbortMerge,
     /// Apply the stash at the given index without removing it.
     StashApply(usize),
     /// Apply the stash at the given index and remove it from the list.
@@ -89,6 +93,8 @@ pub enum GitEvent {
     StatusLoaded {
         unstaged: Vec<FileEntry>,
         staged: Vec<FileEntry>,
+        /// Files left with merge conflicts to resolve.
+        conflicted: Vec<FileEntry>,
         head: HeadInfo,
     },
     /// A freshly loaded Diff for the selected file.
@@ -258,6 +264,19 @@ pub enum ChangeKind {
     Renamed,
     Untracked,
     Typechange,
+    /// A merge left this file with conflicts to resolve.
+    Conflicted,
+}
+
+/// Which side to take when resolving a conflicted file in one click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictSide {
+    /// Keep the current branch's version.
+    Ours,
+    /// Keep the merged-in branch's version.
+    Theirs,
+    /// Keep both, ours then theirs.
+    Both,
 }
 
 /// The line-level changes for a single file.

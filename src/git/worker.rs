@@ -221,6 +221,19 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             emit_status(repo, events);
             emit_branches(repo, events);
         }
+        GitCommand::ResolveConflict { path, side } => {
+            if let Err(error) = resolve_conflict(repo, &path, side) {
+                events.emit(GitEvent::Error(error));
+            }
+            emit_status(repo, events);
+        }
+        GitCommand::AbortMerge => {
+            if let Err(error) = abort_merge(repo) {
+                events.emit(GitEvent::Error(error));
+            }
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
         GitCommand::StashApply(index) => {
             match stash_apply(repo, index) {
                 Ok(()) => events.emit(GitEvent::StashApplied),
@@ -252,9 +265,10 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
 /// `StatusLoaded` event carrying all three as a consistent snapshot.
 fn emit_status(repo: &Repository, events: &impl EventSink) {
     match status(repo) {
-        Ok((unstaged, staged)) => events.emit(GitEvent::StatusLoaded {
+        Ok((unstaged, staged, conflicted)) => events.emit(GitEvent::StatusLoaded {
             unstaged,
             staged,
+            conflicted,
             head: head_info(repo),
         }),
         Err(error) => events.emit(GitEvent::Error(GitError::new("refresh status", &error))),
@@ -342,8 +356,10 @@ fn unborn_branch_name(repo: &Repository) -> Option<String> {
         .map(|target| target.trim_start_matches("refs/heads/").to_string())
 }
 
-/// Collect the Unstaged/Untracked files and the Staged files.
-fn status(repo: &Repository) -> Result<(Vec<FileEntry>, Vec<FileEntry>), git2::Error> {
+/// Collect the Unstaged/Untracked files, the Staged files, and any files left
+/// in conflict by an in-progress merge.
+type StatusLists = (Vec<FileEntry>, Vec<FileEntry>, Vec<FileEntry>);
+fn status(repo: &Repository) -> Result<StatusLists, git2::Error> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
@@ -354,6 +370,7 @@ fn status(repo: &Repository) -> Result<(Vec<FileEntry>, Vec<FileEntry>), git2::E
     let statuses = repo.statuses(Some(&mut options))?;
     let mut unstaged = Vec::new();
     let mut staged = Vec::new();
+    let mut conflicted = Vec::new();
 
     for entry in statuses.iter() {
         let status = entry.status();
@@ -362,6 +379,16 @@ fn status(repo: &Repository) -> Result<(Vec<FileEntry>, Vec<FileEntry>), git2::E
             // Non-UTF-8 paths are skipped rather than mangled.
             Err(_) => continue,
         };
+
+        // A conflicted file is its own category — it must be resolved before it
+        // can be staged or committed — so it skips the usual classification.
+        if status.contains(Status::CONFLICTED) {
+            conflicted.push(FileEntry {
+                path,
+                change: ChangeKind::Conflicted,
+            });
+            continue;
+        }
 
         if let Some(change) = worktree_change(status) {
             unstaged.push(FileEntry {
@@ -374,7 +401,7 @@ fn status(repo: &Repository) -> Result<(Vec<FileEntry>, Vec<FileEntry>), git2::E
         }
     }
 
-    Ok((unstaged, staged))
+    Ok((unstaged, staged, conflicted))
 }
 
 /// Map the Working-Tree-side status bits to a [`ChangeKind`], if any.
@@ -540,7 +567,7 @@ fn discard_all(repo: &Repository) -> Result<(), GitError> {
     repo.checkout_index(None, Some(&mut checkout))
         .map_err(|error| GitError::new("discard all", &error))?;
 
-    let (unstaged, _) = status(repo).map_err(|error| GitError::new("discard all", &error))?;
+    let (unstaged, _, _) = status(repo).map_err(|error| GitError::new("discard all", &error))?;
     for entry in unstaged {
         if entry.change == ChangeKind::Untracked {
             delete_from_workdir(repo, &entry.path)?;
@@ -965,7 +992,7 @@ fn stash_push(repo: &Repository, message: Option<&str>, paths: &[String]) -> Res
 
     // The other changed files (path, is_untracked) — everything we must keep out
     // of the stash and restore afterwards.
-    let (unstaged, staged) = status(&repo).map_err(|e| make(&e))?;
+    let (unstaged, staged, _) = status(&repo).map_err(|e| make(&e))?;
     let mut kept: Vec<(String, bool)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in unstaged.iter().chain(staged.iter()) {
@@ -1268,6 +1295,82 @@ fn merge_branch(repo: &Repository, name: &str) -> Result<MergeOutcome, GitError>
     Ok(MergeOutcome::Created)
 }
 
+/// Resolve a conflicted file by taking one side (ours, theirs, or both), then
+/// stage the result so the merge can be committed.
+fn resolve_conflict(repo: &Repository, path: &str, side: ConflictSide) -> Result<(), GitError> {
+    let make = |error: &git2::Error| GitError::new("resolve conflict", error);
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::custom("resolve conflict", "no working directory"))?
+        .to_path_buf();
+
+    let mut index = repo.index().map_err(|e| make(&e))?;
+
+    // Find this path's conflict entry and read the blob oids for each side.
+    let conflicts = index.conflicts().map_err(|e| make(&e))?;
+    let mut our_oid = None;
+    let mut their_oid = None;
+    for conflict in conflicts {
+        let conflict = conflict.map_err(|e| make(&e))?;
+        let matches = |entry: &Option<git2::IndexEntry>| {
+            entry
+                .as_ref()
+                .and_then(|e| std::str::from_utf8(&e.path).ok())
+                .is_some_and(|p| p == path)
+        };
+        if matches(&conflict.our) || matches(&conflict.their) || matches(&conflict.ancestor) {
+            our_oid = conflict.our.map(|e| e.id);
+            their_oid = conflict.their.map(|e| e.id);
+            break;
+        }
+    }
+
+    let blob = |oid: Option<git2::Oid>| -> Result<Vec<u8>, GitError> {
+        match oid {
+            Some(oid) => Ok(repo.find_blob(oid).map_err(|e| make(&e))?.content().to_vec()),
+            None => Ok(Vec::new()),
+        }
+    };
+
+    let content = match side {
+        ConflictSide::Ours => blob(our_oid)?,
+        ConflictSide::Theirs => blob(their_oid)?,
+        ConflictSide::Both => {
+            let mut both = blob(our_oid)?;
+            if !both.is_empty() && !both.ends_with(b"\n") {
+                both.push(b'\n');
+            }
+            both.extend_from_slice(&blob(their_oid)?);
+            both
+        }
+    };
+
+    let full = workdir.join(path);
+    std::fs::write(&full, &content)
+        .map_err(|error| GitError::custom("resolve conflict", error.to_string()))?;
+
+    // Clear the conflict and stage the resolved content.
+    let path_ref = Path::new(path);
+    let _ = index.conflict_remove(path_ref);
+    index.add_path(path_ref).map_err(|e| make(&e))?;
+    index.write().map_err(|e| make(&e))?;
+    Ok(())
+}
+
+/// Abort an in-progress merge: discard the half-merged Working Tree and index by
+/// resetting hard to HEAD, then clear the merge state.
+fn abort_merge(repo: &Repository) -> Result<(), GitError> {
+    let make = |context: &str, error: &git2::Error| GitError::new(context, error);
+    let head = repo
+        .head()
+        .and_then(|h| h.peel(ObjectType::Commit))
+        .map_err(|e| make("abort merge", &e))?;
+    repo.reset(&head, git2::ResetType::Hard, None)
+        .map_err(|e| make("abort merge", &e))?;
+    repo.cleanup_state().map_err(|e| make("abort merge", &e))?;
+    Ok(())
+}
+
 /// Delete a local branch. Refuses to delete the branch currently checked out.
 fn delete_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
     let mut branch = repo
@@ -1456,6 +1559,19 @@ mod tests {
                     _ => None,
                 })
                 .expect("expected a BranchesLoaded event")
+        }
+
+        /// The conflicted files from the most recent `StatusLoaded`.
+        fn last_conflicted(&self) -> Vec<FileEntry> {
+            self.0
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    GitEvent::StatusLoaded { conflicted, .. } => Some(conflicted.clone()),
+                    _ => None,
+                })
+                .expect("expected a StatusLoaded event")
         }
 
         /// The stash list from the most recent `StashesLoaded`.
@@ -2377,6 +2493,91 @@ mod tests {
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.parent_count(), 2);
+    }
+
+    /// Build a conflict on `a.txt`: "feature" on the feature branch, "master" on
+    /// master, with the merge left in a conflicted state.
+    fn conflicted_repo() -> (TempDir, Repository, Collector) {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "base\n");
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "a.txt", "feature\n");
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+        commit_file(dir.path(), &repo, &events, "a.txt", "master\n");
+        process(&repo, GitCommand::Merge("feature".into()), &events);
+        assert_eq!(last_merge(&events), MergeOutcome::Conflicts(1));
+        (dir, repo, events)
+    }
+
+    #[test]
+    fn resolving_a_conflict_with_ours_keeps_our_version_and_clears_the_conflict() {
+        let (dir, repo, events) = conflicted_repo();
+
+        process(
+            &repo,
+            GitCommand::ResolveConflict {
+                path: "a.txt".into(),
+                side: ConflictSide::Ours,
+            },
+            &events,
+        );
+
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "master\n");
+        assert!(events.last_conflicted().is_empty());
+
+        // The resolved file is staged, so the merge can be committed.
+        process(&repo, GitCommand::Commit("merge".into()), &events);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().parent_count(), 2);
+    }
+
+    #[test]
+    fn resolving_a_conflict_with_theirs_takes_the_merged_in_version() {
+        let (dir, repo, events) = conflicted_repo();
+
+        process(
+            &repo,
+            GitCommand::ResolveConflict {
+                path: "a.txt".into(),
+                side: ConflictSide::Theirs,
+            },
+            &events,
+        );
+
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "feature\n");
+        assert!(events.last_conflicted().is_empty());
+    }
+
+    #[test]
+    fn resolving_a_conflict_with_both_keeps_each_side() {
+        let (dir, repo, events) = conflicted_repo();
+
+        process(
+            &repo,
+            GitCommand::ResolveConflict {
+                path: "a.txt".into(),
+                side: ConflictSide::Both,
+            },
+            &events,
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "master\nfeature\n"
+        );
+        assert!(events.last_conflicted().is_empty());
+    }
+
+    #[test]
+    fn aborting_a_merge_restores_head_and_clears_the_conflict() {
+        let (dir, repo, events) = conflicted_repo();
+
+        process(&repo, GitCommand::AbortMerge, &events);
+
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "master\n");
+        assert!(events.last_conflicted().is_empty());
     }
 }
 

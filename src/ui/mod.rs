@@ -19,8 +19,8 @@ use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Righ
 
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
 use crate::git::{
-    BranchInfo, ChangeKind, CommitInfo, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo,
-    StashInfo,
+    BranchInfo, ChangeKind, CommitInfo, ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry,
+    HeadInfo, StashInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -218,6 +218,15 @@ fn file_list(app: &App) -> Element<'_, Message> {
     let mut items: Vec<Element<Message>> = Vec::new();
 
     items.push(action_toolbar(app));
+
+    // Merge conflicts come first: they block committing until resolved.
+    if !repo.conflicted.is_empty() {
+        items.push(conflicts_header(repo.conflicted.len()));
+        for entry in &repo.conflicted {
+            items.push(conflict_row(app, entry));
+        }
+        items.push(gap(10.0));
+    }
 
     items.push(section_header(app, "Unstaged", style::YELLOW, false));
     if repo.unstaged.is_empty() {
@@ -562,9 +571,74 @@ fn badge_color(change: ChangeKind) -> iced::Color {
     match change {
         ChangeKind::Added => style::GREEN,
         ChangeKind::Untracked => style::YELLOW,
-        ChangeKind::Deleted => style::RED,
+        ChangeKind::Deleted | ChangeKind::Conflicted => style::RED,
         ChangeKind::Modified | ChangeKind::Renamed | ChangeKind::Typechange => style::INFO,
     }
+}
+
+/// The Conflicts section heading: a count chip and an "Abort merge" escape hatch.
+fn conflicts_header<'a>(count: usize) -> Element<'a, Message> {
+    let chip = container(text(count.to_string()).size(11).color(style::RED))
+        .style(style::chip(style::RED))
+        .padding([1, 7]);
+    let abort = button(text("Abort merge").size(11))
+        .on_press(Message::Git(GitMessage::AbortMerge))
+        .padding([2, 9])
+        .style(style::secondary_danger);
+
+    container(
+        row![
+            text("CONFLICTS").size(11).color(style::RED),
+            chip,
+            space::horizontal(),
+            abort,
+        ]
+        .spacing(10)
+        .align_y(Center),
+    )
+    .padding([6, 0])
+    .into()
+}
+
+/// One conflicted file: a click target to view it, plus one-click resolutions —
+/// keep ours, theirs, or both — that stage the result.
+fn conflict_row<'a>(app: &App, entry: &FileEntry) -> Element<'a, Message> {
+    let path = entry.path.clone();
+    let active = app.repo.selected.as_ref().is_some_and(|s| !s.staged && s.path == path);
+    let leaf = path.rsplit('/').next().unwrap_or(&path).to_string();
+
+    let dot = container(text(""))
+        .width(Length::Fixed(9.0))
+        .height(Length::Fixed(9.0))
+        .style(style::dot(style::RED));
+    let name = button(row![dot, text(leaf).size(14)].spacing(10).align_y(Center))
+        .on_press(Message::Ui(UiMessage::FileSelected {
+            path: path.clone(),
+            staged: false,
+        }))
+        .width(Fill)
+        .padding([6, 8])
+        .style(style::file_item(active));
+
+    let resolve = |label: &str, side: ConflictSide| {
+        button(text(label.to_string()).size(11))
+            .on_press(Message::Git(GitMessage::ResolveConflict {
+                path: path.clone(),
+                side,
+            }))
+            .padding([3, 8])
+            .style(style::ghost)
+    };
+
+    row![
+        name,
+        resolve("Ours", ConflictSide::Ours),
+        resolve("Theirs", ConflictSide::Theirs),
+        resolve("Both", ConflictSide::Both),
+    ]
+    .spacing(4)
+    .align_y(Center)
+    .into()
 }
 
 // ── History List ─────────────────────────────────────────────────────────
