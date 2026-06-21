@@ -151,6 +151,13 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             }
             emit_status(repo, events);
         }
+        GitCommand::CherryPick(sha) => {
+            match cherry_pick(repo, &sha) {
+                Ok(outcome) => events.emit(GitEvent::CherryPicked { outcome }),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_status(repo, events);
+        }
         GitCommand::LoadBranches => emit_branches(repo, events),
         GitCommand::LoadTags => emit_tags(repo, events),
         GitCommand::CreateTag { name, message } => {
@@ -901,6 +908,54 @@ fn revert(repo: &Repository, sha: &str) -> Result<RevertOutcome, GitError> {
     repo.cleanup_state().map_err(|e| make("revert", &e))?;
 
     Ok(RevertOutcome::Created)
+}
+
+/// Cherry-pick the Commit `sha`: apply its changes on top of HEAD. A clean pick
+/// is committed straight away (`git cherry-pick --no-edit`), keeping the original
+/// message and author; a conflicting one is left in place — with
+/// CHERRY_PICK_HEAD set — for the user to resolve and commit (see [`commit`],
+/// which clears the cherry-pick state).
+fn cherry_pick(repo: &Repository, sha: &str) -> Result<CherryPickOutcome, GitError> {
+    let make = |context: &str, error: &git2::Error| GitError::new(context, error);
+    let oid = git2::Oid::from_str(sha).map_err(|e| make("cherry-pick", &e))?;
+    let commit = repo.find_commit(oid).map_err(|e| make("cherry-pick", &e))?;
+
+    repo.cherrypick(&commit, None)
+        .map_err(|e| make("cherry-pick", &e))?;
+
+    let mut index = repo.index().map_err(|e| make("cherry-pick", &e))?;
+    if index.has_conflicts() {
+        let conflicts = index
+            .conflicts()
+            .map(|iter| iter.count())
+            .unwrap_or(0)
+            .max(1);
+        return Ok(CherryPickOutcome::Conflicts(conflicts));
+    }
+
+    // Clean pick: record a single-parent commit on HEAD, keeping the original
+    // commit's message and author (with us as the committer), then clear state.
+    let tree = repo
+        .find_tree(index.write_tree().map_err(|e| make("cherry-pick", &e))?)
+        .map_err(|e| make("cherry-pick", &e))?;
+    let committer = repo.signature().map_err(|e| make("cherry-pick", &e))?;
+    let head = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| make("cherry-pick", &e))?;
+    let message = commit.message().unwrap_or_default();
+    repo.commit(
+        Some("HEAD"),
+        &commit.author(),
+        &committer,
+        message,
+        &tree,
+        &[&head],
+    )
+    .map_err(|e| make("cherry-pick", &e))?;
+    repo.cleanup_state().map_err(|e| make("cherry-pick", &e))?;
+
+    Ok(CherryPickOutcome::Created)
 }
 
 /// Push the current branch to `origin` over SSH. When the branch has no
@@ -2805,6 +2860,64 @@ mod tests {
         write(dir.path(), "a.txt", "resolved\n");
         process(&repo, GitCommand::StageFile("a.txt".into()), &events);
         process(&repo, GitCommand::Commit("finish revert".into()), &events);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    }
+
+    #[test]
+    fn cherry_pick_applies_a_commit_onto_head() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        // A commit on `feature` adding c.txt — the one to cherry-pick.
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "c.txt", "pick me\n");
+        let pick = repo.head().unwrap().target().unwrap().to_string();
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+
+        // master has no c.txt yet; cherry-picking brings it over cleanly.
+        assert!(!dir.path().join("c.txt").exists());
+        process(&repo, GitCommand::CherryPick(pick), &events);
+
+        assert!(matches!(
+            events.events().iter().rev().find_map(|e| match e {
+                GitEvent::CherryPicked { outcome } => Some(outcome.clone()),
+                _ => None,
+            }),
+            Some(CherryPickOutcome::Created)
+        ));
+        // The picked change is on top, keeping the original message, single-parent.
+        assert_eq!(fs::read_to_string(dir.path().join("c.txt")).unwrap(), "pick me\n");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap().unwrap(), "add c.txt");
+        assert_eq!(head.parent_count(), 1);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    }
+
+    #[test]
+    fn conflicting_cherry_pick_is_reported_and_finished_by_a_commit() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        // feature and master change the same line differently.
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "a.txt", "feature\n");
+        let pick = repo.head().unwrap().target().unwrap().to_string();
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+        commit_file(dir.path(), &repo, &events, "a.txt", "master\n");
+
+        process(&repo, GitCommand::CherryPick(pick), &events);
+
+        let outcome = events.events().into_iter().rev().find_map(|e| match e {
+            GitEvent::CherryPicked { outcome } => Some(outcome),
+            _ => None,
+        });
+        assert!(matches!(outcome, Some(CherryPickOutcome::Conflicts(_))));
+        assert_ne!(repo.state(), git2::RepositoryState::Clean);
+
+        // Resolving and committing finishes the pick and clears the state.
+        write(dir.path(), "a.txt", "resolved\n");
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Commit("finish pick".into()), &events);
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
     }
 

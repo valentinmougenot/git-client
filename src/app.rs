@@ -15,7 +15,8 @@ use iced::{Point, Subscription, Task};
 
 use crate::git::{
     self, BranchInfo, CommitDetail, CommitInfo, ConflictSide, Diff, FileEntry, GitCommand, GitEvent,
-    HeadInfo, MergeOutcome, ResetKind, RevertOutcome, StashDiff, StashInfo, TagInfo,
+    CherryPickOutcome, HeadInfo, MergeOutcome, ResetKind, RevertOutcome, StashDiff, StashInfo,
+    TagInfo,
 };
 use crate::ui;
 
@@ -73,21 +74,36 @@ pub struct App {
     /// Whether Discard is armed, awaiting a confirming second press.
     pub discard_armed: bool,
     /// The last known cursor position (window coordinates), tracked while the
-    /// History view is open so a right-click menu can open at the pointer.
+    /// a list view is open so a right-click menu can open at the pointer.
     pub cursor: Point,
-    /// The open commit context menu (right-click on a History commit), if any.
-    pub commit_menu: Option<CommitMenu>,
+    /// The open right-click context menu, if any.
+    pub menu: Option<ContextMenu>,
 }
 
-/// An open right-click context menu over a History commit: which commit, where
-/// to draw it, and whether its destructive Hard reset is armed.
-pub struct CommitMenu {
-    pub sha: String,
-    pub short_sha: String,
+/// An open right-click context menu: what it acts on, where to draw it, and
+/// whether its one destructive action is armed (awaiting a confirming second
+/// press, like the inline confirmations it replaces).
+pub struct ContextMenu {
+    pub target: MenuTarget,
     pub at: Point,
-    /// Whether "Reset (hard)" has been armed by a first press (it needs a
-    /// confirming second press, like the other destructive actions).
-    pub hard_armed: bool,
+    pub armed: bool,
+}
+
+/// What a [`ContextMenu`] acts on, with the bits its actions need captured at
+/// open time (so the menu reads from the click, not from shifting state).
+#[derive(Debug, Clone)]
+pub enum MenuTarget {
+    /// A History commit: Revert / Reset (soft, mixed, hard).
+    Commit { sha: String, short_sha: String },
+    /// A branch: Checkout / Merge / Delete (locals only).
+    Branch {
+        name: String,
+        is_remote: bool,
+    },
+    /// A saved stash: Apply / Pop / Drop.
+    Stash { index: usize },
+    /// A tag: Push / Delete.
+    Tag { name: String },
 }
 
 /// The Commit history view's state: the loaded log, the selected Commit, and
@@ -106,8 +122,6 @@ pub struct HistoryState {
 pub struct BranchesState {
     pub branches: Vec<BranchInfo>,
     pub new_name: String,
-    /// The branch awaiting a confirming second Delete press, if any.
-    pub delete_armed: Option<String>,
     /// Whether Prune is armed, awaiting a confirming second press.
     pub prune_armed: bool,
 }
@@ -118,8 +132,6 @@ pub struct BranchesState {
 pub struct StashesState {
     pub stashes: Vec<StashInfo>,
     pub message: String,
-    /// The stash index awaiting a confirming second Drop press, if any.
-    pub drop_armed: Option<usize>,
     /// The stash whose Diff is shown in the detail panel, if any.
     pub selected: Option<usize>,
     /// The loaded Diff of the selected stash.
@@ -134,8 +146,6 @@ pub struct TagsState {
     pub new_name: String,
     /// Optional annotation message for the new tag (annotated when non-empty).
     pub message: String,
-    /// The tag awaiting a confirming second Delete press, if any.
-    pub delete_armed: Option<String>,
 }
 
 /// Working Tree and Staging Area contents, the HEAD/branch context, the
@@ -260,10 +270,10 @@ pub enum UiMessage {
     ShowView(ViewMode),
     /// Select a Commit in the History view and load its detail.
     CommitSelected(String),
-    /// Open the right-click context menu for a History commit (at the cursor).
-    OpenCommitMenu(String),
-    /// Close the open commit context menu.
-    CloseCommitMenu,
+    /// Open a right-click context menu for the given target (at the cursor).
+    OpenMenu(MenuTarget),
+    /// Arm the open menu's destructive action (its confirming first press).
+    ArmMenu,
     /// The new-branch name field changed.
     NewBranchNameChanged(String),
     /// The new-tag name field changed.
@@ -328,6 +338,8 @@ pub enum GitMessage {
     Reset { sha: String, kind: ResetKind },
     /// Revert a Commit (apply its inverse on top of HEAD).
     Revert(String),
+    /// Cherry-pick a Commit (apply its changes on top of HEAD).
+    CherryPick(String),
     Push,
     Pull,
     /// Update remote-tracking branches from the Remote without merging.
@@ -363,7 +375,7 @@ impl App {
             collapsed: HashSet::new(),
             discard_armed: false,
             cursor: Point::ORIGIN,
-            commit_menu: None,
+            menu: None,
         }
     }
 
@@ -387,13 +399,14 @@ impl App {
     }
 
     fn update_ui(&mut self, message: UiMessage) {
-        // Interacting elsewhere cancels a pending Discard, branch-delete,
-        // prune, or stash-drop confirmation.
+        // Interacting elsewhere cancels a pending Discard or Prune confirmation.
         self.discard_armed = false;
-        self.branches.delete_armed = None;
         self.branches.prune_armed = false;
-        self.stashes.drop_armed = None;
-        self.tags.delete_armed = None;
+        // Any interaction other than opening/arming a menu dismisses it — so a
+        // click outside lands on its target AND closes the menu in one go.
+        if !matches!(message, UiMessage::OpenMenu(_) | UiMessage::ArmMenu) {
+            self.menu = None;
+        }
 
         match message {
             UiMessage::FileSelected { path, staged } => self.select(path, staged),
@@ -424,8 +437,12 @@ impl App {
             UiMessage::SelectPrevious => self.move_selection(-1),
             UiMessage::ShowView(view) => self.show_view(view),
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
-            UiMessage::OpenCommitMenu(sha) => self.open_commit_menu(sha),
-            UiMessage::CloseCommitMenu => self.commit_menu = None,
+            UiMessage::OpenMenu(target) => self.open_menu(target),
+            UiMessage::ArmMenu => {
+                if let Some(menu) = &mut self.menu {
+                    menu.armed = true;
+                }
+            }
             UiMessage::NewBranchNameChanged(name) => self.branches.new_name = name,
             UiMessage::NewTagNameChanged(name) => self.tags.new_name = name,
             UiMessage::TagMessageChanged(message) => self.tags.message = message,
@@ -453,23 +470,17 @@ impl App {
         }
     }
 
-    /// Open the right-click context menu for a History commit at the cursor,
-    /// selecting it too so its detail shows alongside the menu.
-    fn open_commit_menu(&mut self, sha: String) {
-        let short_sha = self
-            .history
-            .commits
-            .iter()
-            .find(|c| c.sha == sha)
-            .map(|c| c.short_sha.clone())
-            .unwrap_or_else(|| sha.chars().take(7).collect());
-        self.commit_menu = Some(CommitMenu {
-            sha: sha.clone(),
-            short_sha,
+    /// Open a right-click context menu for `target` at the cursor. A commit
+    /// target is also selected so its detail shows alongside the menu.
+    fn open_menu(&mut self, target: MenuTarget) {
+        self.menu = Some(ContextMenu {
+            target: target.clone(),
             at: self.cursor,
-            hard_armed: false,
+            armed: false,
         });
-        self.select_commit(sha);
+        if let MenuTarget::Commit { sha, .. } = target {
+            self.select_commit(sha);
+        }
     }
 
     /// Select a Commit and request its detail.
@@ -480,28 +491,16 @@ impl App {
     }
 
     fn update_git(&mut self, message: GitMessage) {
-        // Any git action other than re-pressing Discard cancels its pending
-        // confirmation.
+        // Re-pressing Discard or Prune keeps its own arm; any other action
+        // cancels it. (The context-menu actions confirm via the menu itself.)
         if !matches!(message, GitMessage::DiscardChecked) {
             self.discard_armed = false;
         }
-        // Likewise, anything but pressing Delete again cancels an armed branch
-        // deletion.
-        if !matches!(message, GitMessage::DeleteBranch(_)) {
-            self.branches.delete_armed = None;
-        }
-        // And anything but pressing Prune again cancels an armed prune.
         if !matches!(message, GitMessage::PruneBranches) {
             self.branches.prune_armed = false;
         }
-        // And anything but re-pressing the same Drop cancels an armed stash drop.
-        if !matches!(message, GitMessage::StashDrop(_)) {
-            self.stashes.drop_armed = None;
-        }
-        // And anything but re-pressing the same tag Delete cancels its arm.
-        if !matches!(message, GitMessage::DeleteTag(_)) {
-            self.tags.delete_armed = None;
-        }
+        // Any git action fires on this press, so it also dismisses the menu.
+        self.menu = None;
 
         match message {
             GitMessage::StageSelected => {
@@ -589,13 +588,9 @@ impl App {
                 }
             }
             GitMessage::DeleteBranch(name) => {
-                // First press arms this branch; the confirming second deletes it.
-                if self.branches.delete_armed.as_deref() == Some(name.as_str()) {
-                    self.branches.delete_armed = None;
-                    self.dispatch(GitCommand::DeleteBranch(name));
-                } else {
-                    self.branches.delete_armed = Some(name);
-                }
+                // The confirmation is handled in the context menu (ArmMenu), so
+                // by the time this arrives it is confirmed.
+                self.dispatch(GitCommand::DeleteBranch(name));
             }
             GitMessage::PruneBranches => {
                 // First press arms; the confirming second prunes.
@@ -614,36 +609,16 @@ impl App {
                     self.dispatch(GitCommand::CreateTag { name, message });
                 }
             }
-            GitMessage::DeleteTag(name) => {
-                // First press arms this tag; the confirming second deletes it.
-                if self.tags.delete_armed.as_deref() == Some(name.as_str()) {
-                    self.tags.delete_armed = None;
-                    self.dispatch(GitCommand::DeleteTag(name));
-                } else {
-                    self.tags.delete_armed = Some(name);
-                }
-            }
+            GitMessage::DeleteTag(name) => self.dispatch(GitCommand::DeleteTag(name)),
             GitMessage::PushTag(name) => {
                 self.start_remote("Pushing tag…", GitCommand::PushTag(name))
             }
             GitMessage::Reset { sha, kind } => {
-                // A Hard reset discards uncommitted work, so it takes a
-                // confirming second press in the menu before it fires.
-                if kind == ResetKind::Hard
-                    && self.commit_menu.as_ref().is_some_and(|m| !m.hard_armed)
-                {
-                    if let Some(menu) = &mut self.commit_menu {
-                        menu.hard_armed = true;
-                    }
-                    return;
-                }
-                self.commit_menu = None;
+                // The Hard-reset confirmation is handled in the menu (ArmMenu).
                 self.dispatch(GitCommand::Reset { sha, kind });
             }
-            GitMessage::Revert(sha) => {
-                self.commit_menu = None;
-                self.dispatch(GitCommand::Revert(sha));
-            }
+            GitMessage::Revert(sha) => self.dispatch(GitCommand::Revert(sha)),
+            GitMessage::CherryPick(sha) => self.dispatch(GitCommand::CherryPick(sha)),
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
             GitMessage::Fetch => self.start_remote("Fetching…", GitCommand::Fetch),
@@ -669,15 +644,7 @@ impl App {
             }
             GitMessage::StashApply(index) => self.dispatch(GitCommand::StashApply(index)),
             GitMessage::StashPop(index) => self.dispatch(GitCommand::StashPop(index)),
-            GitMessage::StashDrop(index) => {
-                // First press arms this stash; the confirming second drops it.
-                if self.stashes.drop_armed == Some(index) {
-                    self.stashes.drop_armed = None;
-                    self.dispatch(GitCommand::StashDrop(index));
-                } else {
-                    self.stashes.drop_armed = Some(index);
-                }
-            }
+            GitMessage::StashDrop(index) => self.dispatch(GitCommand::StashDrop(index)),
         }
     }
 
@@ -808,6 +775,21 @@ impl App {
                     self.view = ViewMode::Changes;
                 }
             },
+            GitEvent::CherryPicked { outcome } => match outcome {
+                CherryPickOutcome::Created => {
+                    self.notify("Cherry-picked commit".to_string());
+                    self.dispatch(GitCommand::LoadHistory);
+                }
+                CherryPickOutcome::Conflicts(n) => {
+                    // Surface the conflicts; the user resolves them in the
+                    // Changes view and commits (which finishes the cherry-pick).
+                    let files = if n == 1 { "file" } else { "files" };
+                    self.status.message = Some(format!(
+                        "Cherry-pick has conflicts in {n} {files} — resolve them, then commit"
+                    ));
+                    self.view = ViewMode::Changes;
+                }
+            },
             GitEvent::Committed(sha) => {
                 self.commit.committing = false;
                 self.commit.message.clear();
@@ -826,7 +808,6 @@ impl App {
             GitEvent::CheckedOut(name) => {
                 self.notify(format!("Switched to {name}"));
                 self.branches.new_name.clear();
-                self.branches.delete_armed = None;
                 // The new branch has its own history; refresh if it is showing.
                 if self.view == ViewMode::History {
                     self.dispatch(GitCommand::LoadHistory);
@@ -834,7 +815,6 @@ impl App {
             }
             GitEvent::BranchDeleted(name) => {
                 self.notify(format!("Deleted {name}"));
-                self.branches.delete_armed = None;
             }
             GitEvent::BranchesPruned(pruned) => {
                 self.branches.prune_armed = false;
@@ -846,7 +826,6 @@ impl App {
             }
             GitEvent::TagsLoaded(tags) => {
                 self.tags.tags = tags;
-                self.tags.delete_armed = None;
             }
             GitEvent::TagCreated(name) => {
                 self.tags.new_name.clear();
@@ -854,7 +833,6 @@ impl App {
                 self.notify(format!("Created tag {name}"));
             }
             GitEvent::TagDeleted(name) => {
-                self.tags.delete_armed = None;
                 self.notify(format!("Deleted tag {name}"));
             }
             GitEvent::Pushed => {
@@ -871,9 +849,8 @@ impl App {
             }
             GitEvent::StashesLoaded(stashes) => {
                 self.stashes.stashes = stashes;
-                // The list was (re)loaded, so any pending confirmation or shown
-                // Diff may now point at a different or vanished stash: reset both.
-                self.stashes.drop_armed = None;
+                // The list was (re)loaded, so the shown Diff may now point at a
+                // different or vanished stash: reset the selection.
                 self.stashes.selected = None;
                 self.stashes.diff = None;
             }
@@ -889,7 +866,6 @@ impl App {
             }
             GitEvent::StashApplied => self.notify("Applied stash".to_string()),
             GitEvent::StashDropped => {
-                self.stashes.drop_armed = None;
                 self.notify("Dropped stash".to_string());
             }
             GitEvent::Merged { branch, outcome } => {
@@ -1113,10 +1089,10 @@ fn subscription(app: &App) -> Subscription<Message> {
         iced::keyboard::listen().map(on_key),
         iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
     ];
-    // Track the pointer only while the History view is open — the one place a
-    // right-click menu opens at the cursor — so we don't re-render on every
-    // mouse move elsewhere.
-    if app.view == ViewMode::History {
+    // Track the pointer in the list views, where a right-click menu opens at
+    // the cursor; the Changes view has no menu, so it skips the tracking (and
+    // its per-move re-renders).
+    if app.view != ViewMode::Changes {
         subs.push(iced::event::listen_with(|event, _status, _window| {
             match event {
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
@@ -1421,20 +1397,56 @@ mod tests {
     }
 
     #[test]
-    fn stash_drop_requires_a_confirming_second_press_on_the_same_stash() {
+    fn opening_a_menu_then_clicking_elsewhere_dismisses_it() {
         let mut app = App::new();
 
-        // First press arms that stash index.
-        update(&mut app, Message::Git(GitMessage::StashDrop(1)));
-        assert_eq!(app.stashes.drop_armed, Some(1));
+        update(
+            &mut app,
+            Message::Ui(UiMessage::OpenMenu(MenuTarget::Stash { index: 1 })),
+        );
+        assert!(app.menu.is_some());
 
-        // A different stash's Drop re-arms rather than firing.
-        update(&mut app, Message::Git(GitMessage::StashDrop(2)));
-        assert_eq!(app.stashes.drop_armed, Some(2));
+        // Any other interaction (the click lands on its target) closes the menu.
+        update(&mut app, Message::Git(GitMessage::StageChecked));
+        assert!(app.menu.is_none());
+    }
 
-        // Re-pressing the armed one fires and disarms.
+    #[test]
+    fn a_destructive_menu_action_arms_then_fires() {
+        let mut app = App::new();
+        update(
+            &mut app,
+            Message::Ui(UiMessage::OpenMenu(MenuTarget::Stash { index: 2 })),
+        );
+
+        // The first (Arm) press keeps the menu open and marks it armed.
+        update(&mut app, Message::Ui(UiMessage::ArmMenu));
+        assert!(app.menu.as_ref().is_some_and(|m| m.armed));
+
+        // The confirming press fires the real action and dismisses the menu.
         update(&mut app, Message::Git(GitMessage::StashDrop(2)));
-        assert_eq!(app.stashes.drop_armed, None);
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn right_clicking_another_row_repositions_the_menu() {
+        let mut app = App::new();
+        update(
+            &mut app,
+            Message::Ui(UiMessage::OpenMenu(MenuTarget::Stash { index: 0 })),
+        );
+        update(
+            &mut app,
+            Message::Ui(UiMessage::OpenMenu(MenuTarget::Tag {
+                name: "v1".into(),
+            })),
+        );
+
+        // The menu now targets the newly right-clicked row, not the first.
+        assert!(matches!(
+            app.menu.as_ref().map(|m| &m.target),
+            Some(MenuTarget::Tag { name }) if name == "v1"
+        ));
     }
 
     #[test]

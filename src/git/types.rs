@@ -49,6 +49,10 @@ pub enum GitCommand {
     /// Revert the given Commit: apply its inverse on top of HEAD. A clean revert
     /// is committed immediately; a conflicting one is left to resolve and commit.
     Revert(String),
+    /// Cherry-pick the given Commit: apply its changes on top of HEAD. A clean
+    /// pick is committed immediately; a conflicting one is left to resolve and
+    /// commit.
+    CherryPick(String),
     /// Load the local branches and their sync state.
     LoadBranches,
     /// Load the tags, pointing at their target Commits.
@@ -128,6 +132,8 @@ pub enum GitEvent {
     ResetDone(String),
     /// A revert finished; carries how it resolved.
     Reverted { outcome: RevertOutcome },
+    /// A cherry-pick finished; carries how it resolved.
+    CherryPicked { outcome: CherryPickOutcome },
     /// The local branches and their sync state.
     BranchesLoaded(Vec<BranchInfo>),
     /// The tags and their target Commits.
@@ -197,6 +203,15 @@ pub enum RevertOutcome {
     /// The revert applied cleanly and was committed.
     Created,
     /// The revert left conflicts in the given number of files to resolve.
+    Conflicts(usize),
+}
+
+/// How a cherry-pick resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CherryPickOutcome {
+    /// The pick applied cleanly and was committed.
+    Created,
+    /// The pick left conflicts in the given number of files to resolve.
     Conflicts(usize),
 }
 

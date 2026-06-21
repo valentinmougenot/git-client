@@ -15,10 +15,11 @@ use iced::widget::{
     button, checkbox, column, container, mouse_area, rich_text, row, scrollable, space, span,
     stack, text, text_input,
 };
-use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Right, Theme};
+use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::app::{
-    App, CommitMenu, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode,
+    App, ContextMenu, GitMessage, HistoryState, MenuTarget, Message, RepoState, Selection,
+    UiMessage, ViewMode,
 };
 use crate::git::{
     BranchInfo, ChangeKind, CommitInfo, ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry,
@@ -88,25 +89,23 @@ pub fn root(app: &App) -> Element<'_, Message> {
         .width(Fill)
         .height(Fill);
 
-    // When a commit context menu is open, float it over everything at the
-    // pointer, with a full-window catcher beneath it that closes on any click.
-    match &app.commit_menu {
-        Some(menu) => {
-            let dismiss = mouse_area(container(space::vertical()).width(Fill).height(Fill))
-                .on_press(Message::Ui(UiMessage::CloseCommitMenu))
-                .on_right_press(Message::Ui(UiMessage::CloseCommitMenu));
-            stack![base, dismiss, commit_menu_overlay(menu)].into()
-        }
+    // When a context menu is open, float it over everything at the pointer.
+    // There is no full-window catcher: clicks elsewhere land on their target
+    // and the update loop dismisses the menu in the same press.
+    match &app.menu {
+        Some(menu) => stack![base, menu_overlay(app, menu)].into(),
         None => base.into(),
     }
 }
 
-/// Position the commit context menu at its anchor point using spacers, leaving
-/// the rest of the layer transparent (clicks there fall through to the catcher).
-fn commit_menu_overlay(menu: &CommitMenu) -> Element<'_, Message> {
+// ── Context Menu ───────────────────────────────────────────────────────────
+
+/// Position the context menu at its anchor point using spacers, leaving the rest
+/// of the layer transparent so clicks there fall through to the content beneath.
+fn menu_overlay<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
     let positioned = row![
         container(text("")).width(Length::Fixed(menu.at.x)),
-        commit_menu_panel(menu),
+        menu_panel(app, menu),
     ];
     column![
         container(text("")).height(Length::Fixed(menu.at.y)),
@@ -115,67 +114,132 @@ fn commit_menu_overlay(menu: &CommitMenu) -> Element<'_, Message> {
     .into()
 }
 
-/// The commit context menu itself: a header with the short SHA, then the
-/// Revert and Reset (soft / mixed / hard) actions. Hard reset arms on first
-/// press and confirms on the second.
-fn commit_menu_panel(menu: &CommitMenu) -> Element<'_, Message> {
-    let sha = menu.sha.clone();
-    let item = |label: &str, message: GitMessage, danger: bool| {
-        let style = if danger {
-            style::ghost_danger as fn(&iced::Theme, button::Status) -> button::Style
-        } else {
-            style::ghost
-        };
-        button(text(label.to_string()).size(13))
-            .on_press(Message::Git(message))
-            .width(Fill)
-            .padding([6, 10])
-            .style(style)
-    };
+/// One menu action: a borderless full-width button. Destructive items take a
+/// confirming second press — the first arms the menu, the second fires.
+fn menu_item<'a>(label: &str, message: Message) -> Element<'a, Message> {
+    button(text(label.to_string()).size(13))
+        .on_press(message)
+        .width(Fill)
+        .padding([6, 10])
+        .style(style::ghost)
+        .into()
+}
 
-    let hard_label = if menu.hard_armed {
-        "Confirm hard reset?"
+/// A destructive menu action: armed shows "Confirm <label>?" (and fires the real
+/// message); unarmed shows the label and only arms the menu.
+fn menu_item_danger<'a>(label: &str, armed: bool, confirm: Message) -> Element<'a, Message> {
+    let (text_label, message) = if armed {
+        (format!("Confirm {}?", label.to_lowercase()), confirm)
     } else {
-        "Reset (hard)"
+        (label.to_string(), Message::Ui(UiMessage::ArmMenu))
     };
+    button(text(text_label).size(13))
+        .on_press(message)
+        .width(Fill)
+        .padding([6, 10])
+        .style(style::ghost_danger)
+        .into()
+}
 
-    let menu_column = column![
-        container(
-            text(format!("Commit {}", menu.short_sha))
-                .size(11)
-                .font(Font::MONOSPACE)
-                .color(style::TEXT_FAINT)
-        )
-        .padding([4, 10]),
-        item("Revert", GitMessage::Revert(sha.clone()), false),
-        item(
-            "Reset (soft)",
-            GitMessage::Reset {
-                sha: sha.clone(),
-                kind: ResetKind::Soft,
-            },
-            false,
-        ),
-        item(
-            "Reset (mixed)",
-            GitMessage::Reset {
-                sha: sha.clone(),
-                kind: ResetKind::Mixed,
-            },
-            false,
-        ),
-        item(
-            hard_label,
-            GitMessage::Reset {
-                sha,
-                kind: ResetKind::Hard,
-            },
-            true,
-        ),
-    ]
-    .spacing(2);
+/// A faint monospace header naming what the menu acts on.
+fn menu_header<'a>(label: String) -> Element<'a, Message> {
+    container(
+        text(label)
+            .size(11)
+            .font(Font::MONOSPACE)
+            .color(style::TEXT_FAINT),
+    )
+    .padding([4, 10])
+    .into()
+}
 
-    container(menu_column)
+/// The context menu's contents, chosen by its target. Each action dispatches an
+/// existing [`GitMessage`]; destructive ones route through the arm/confirm pair.
+fn menu_panel<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
+    let mut items: Vec<Element<Message>> = Vec::new();
+
+    match &menu.target {
+        MenuTarget::Commit { sha, short_sha } => {
+            items.push(menu_header(format!("Commit {short_sha}")));
+            items.push(menu_item(
+                "Cherry-pick",
+                Message::Git(GitMessage::CherryPick(sha.clone())),
+            ));
+            items.push(menu_item(
+                "Revert",
+                Message::Git(GitMessage::Revert(sha.clone())),
+            ));
+            items.push(menu_item(
+                "Reset (soft)",
+                Message::Git(GitMessage::Reset {
+                    sha: sha.clone(),
+                    kind: ResetKind::Soft,
+                }),
+            ));
+            items.push(menu_item(
+                "Reset (mixed)",
+                Message::Git(GitMessage::Reset {
+                    sha: sha.clone(),
+                    kind: ResetKind::Mixed,
+                }),
+            ));
+            items.push(menu_item_danger(
+                "Reset (hard)",
+                menu.armed,
+                Message::Git(GitMessage::Reset {
+                    sha: sha.clone(),
+                    kind: ResetKind::Hard,
+                }),
+            ));
+        }
+        MenuTarget::Branch { name, is_remote } => {
+            items.push(menu_header(name.clone()));
+            items.push(menu_item(
+                "Checkout",
+                Message::Git(GitMessage::Checkout(name.clone())),
+            ));
+            items.push(menu_item(
+                "Merge into current",
+                Message::Git(GitMessage::Merge(name.clone())),
+            ));
+            if !is_remote {
+                items.push(menu_item_danger(
+                    "Delete",
+                    menu.armed,
+                    Message::Git(GitMessage::DeleteBranch(name.clone())),
+                ));
+            }
+        }
+        MenuTarget::Stash { index } => {
+            items.push(menu_header(format!("stash@{{{index}}}")));
+            items.push(menu_item(
+                "Apply",
+                Message::Git(GitMessage::StashApply(*index)),
+            ));
+            items.push(menu_item("Pop", Message::Git(GitMessage::StashPop(*index))));
+            items.push(menu_item_danger(
+                "Drop",
+                menu.armed,
+                Message::Git(GitMessage::StashDrop(*index)),
+            ));
+        }
+        MenuTarget::Tag { name } => {
+            items.push(menu_header(name.clone()));
+            if app.repo.head.has_remote {
+                items.push(menu_item(
+                    "Push",
+                    Message::Git(GitMessage::PushTag(name.clone())),
+                ));
+            }
+            items.push(menu_item_danger(
+                "Delete",
+                menu.armed,
+                Message::Git(GitMessage::DeleteTag(name.clone())),
+            ));
+        }
+    }
+
+    container(column(items).spacing(2))
         .style(style::menu)
         .padding(6)
         .width(Length::Fixed(190.0))
@@ -834,7 +898,10 @@ fn commit_row<'a>(
     let row = container(row![cell, body].spacing(6).align_y(Center))
         .height(Length::Fixed(COMMIT_ROW_H));
     mouse_area(row)
-        .on_right_press(Message::Ui(UiMessage::OpenCommitMenu(commit.sha.clone())))
+        .on_right_press(Message::Ui(UiMessage::OpenMenu(MenuTarget::Commit {
+            sha: commit.sha.clone(),
+            short_sha: commit.short_sha.clone(),
+        })))
         .into()
 }
 
@@ -908,7 +975,6 @@ fn branches_list(app: &App) -> Element<'_, Message> {
     let create = pill("+", 15, "Create", GitMessage::CreateBranch, Tone::Normal, can_create);
     items.push(row![input, create].spacing(6).align_y(Center).into());
 
-    let armed = app.branches.delete_armed.as_deref();
     let (locals, remotes): (Vec<_>, Vec<_>) = app
         .branches
         .branches
@@ -933,13 +999,13 @@ fn branches_list(app: &App) -> Element<'_, Message> {
     if locals.is_empty() {
         items.push(placeholder("No branches yet"));
     } else {
-        push_branch_tree(app, &locals, false, armed, &mut items);
+        push_branch_tree(app, &locals, false, &mut items);
     }
 
     if !remotes.is_empty() {
         items.push(gap(10.0));
         items.push(branch_section_label("REMOTE", remotes.len()));
-        push_branch_tree(app, &remotes, true, None, &mut items);
+        push_branch_tree(app, &remotes, true, &mut items);
     }
 
     scrollable(column(items).spacing(4).padding(12))
@@ -986,7 +1052,6 @@ fn push_branch_tree<'a>(
     app: &'a App,
     branches: &[&'a BranchInfo],
     remote: bool,
-    armed: Option<&'a str>,
     items: &mut Vec<Element<'a, Message>>,
 ) {
     let path_of = |branch: &&'a BranchInfo| -> &str {
@@ -998,7 +1063,7 @@ fn push_branch_tree<'a>(
         }
     };
     for node in tree::build(branches, path_of) {
-        push_branch_node(app, node, remote, 0, armed, items);
+        push_branch_node(app, node, remote, 0, items);
     }
 }
 
@@ -1007,13 +1072,12 @@ fn push_branch_node<'a>(
     node: tree::Node<'_, &'a BranchInfo>,
     remote: bool,
     depth: usize,
-    armed: Option<&str>,
     items: &mut Vec<Element<'a, Message>>,
 ) {
     match node {
         tree::Node::Leaf(branch) => {
             let branch: &'a BranchInfo = branch;
-            items.push(branch_row(branch, armed == Some(branch.name.as_str()), depth));
+            items.push(branch_row(branch, depth));
         }
         tree::Node::Dir {
             name,
@@ -1024,7 +1088,7 @@ fn push_branch_node<'a>(
             items.push(branch_dir_row(&name, &path, remote, depth, collapsed));
             if !collapsed {
                 for child in children {
-                    push_branch_node(app, child, remote, depth + 1, armed, items);
+                    push_branch_node(app, child, remote, depth + 1, items);
                 }
             }
         }
@@ -1070,10 +1134,10 @@ fn branch_dir_row<'a>(
         .into()
 }
 
-/// One branch leaf: a current-branch marker, its (leaf) name, its sync state,
-/// and — for any branch other than the current one — a click target to switch to
-/// it and a delete button.
-fn branch_row<'a>(branch: &BranchInfo, armed: bool, depth: usize) -> Element<'a, Message> {
+/// One branch leaf: a current-branch marker, its (leaf) name, and its sync
+/// state. Clicking switches to it (except the current one); right-clicking opens
+/// its actions (Checkout / Merge / Delete).
+fn branch_row<'a>(branch: &BranchInfo, depth: usize) -> Element<'a, Message> {
     let bar = container(text(""))
         .width(Length::Fixed(3.0))
         .height(Length::Fixed(16.0))
@@ -1123,8 +1187,8 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool, depth: usize) -> Element<'a,
         .padding([6, 8])
         .style(style::file_item(branch.is_head));
 
-    // The current branch is only ever a switch target's "you are here" — no
-    // in-row actions (you can't merge or delete the branch you're on).
+    // The current branch is only ever a "you are here" marker — no actions
+    // (you can't checkout, merge, or delete the branch you're on).
     if branch.is_head {
         return row![tree_indent(depth), select]
             .spacing(8)
@@ -1132,33 +1196,14 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool, depth: usize) -> Element<'a,
             .into();
     }
 
-    // Quiet, borderless actions sitting inside the row's rectangle, right-
-    // aligned and stacked over the switch button so their own clicks are caught
-    // while the rest of the row still triggers the checkout beneath them. Merge
-    // is offered for any other branch (local or remote); Delete only for locals.
-    let merge = button(text("Merge").size(11))
-        .on_press(Message::Git(GitMessage::Merge(branch.name.clone())))
-        .padding([4, 8])
-        .style(style::ghost);
-    let mut actions = row![merge].spacing(2).align_y(Center);
-    if !branch.is_remote {
-        let delete =
-            button(text(if armed { "Confirm?" } else { "✕" }).size(if armed { 11 } else { 13 }))
-                .on_press(Message::Git(GitMessage::DeleteBranch(branch.name.clone())))
-                .padding([4, 8])
-                .style(style::ghost_danger);
-        actions = actions.push(delete);
-    }
-    let actions = container(actions)
-        .width(Fill)
-        .height(Fill)
-        .align_x(Right)
-        .center_y(Fill)
-        .padding([0, 6]);
-
-    row![tree_indent(depth), stack![select, actions]]
-        .spacing(8)
-        .align_y(Center)
+    // Any other branch carries its actions on right-click (Checkout / Merge /
+    // Delete) rather than inline buttons.
+    let row = row![tree_indent(depth), select].spacing(8).align_y(Center);
+    mouse_area(row)
+        .on_right_press(Message::Ui(UiMessage::OpenMenu(MenuTarget::Branch {
+            name: branch.name.clone(),
+            is_remote: branch.is_remote,
+        })))
         .into()
 }
 
@@ -1180,7 +1225,7 @@ fn branches_detail(app: &App) -> Element<'_, Message> {
         );
     }
     lines = lines.push(
-        text("Click a branch to switch · Merge into current · ✕ to delete")
+        text("Click a branch to switch · right-click for Merge / Delete")
             .size(12)
             .color(style::TEXT_FAINT),
     );
@@ -1214,14 +1259,9 @@ fn stashes_list(app: &App) -> Element<'_, Message> {
     if app.stashes.stashes.is_empty() {
         items.push(placeholder("No stashes"));
     } else {
-        let armed = app.stashes.drop_armed;
         let selected = app.stashes.selected;
         for stash in &app.stashes.stashes {
-            items.push(stash_row(
-                stash,
-                armed == Some(stash.index),
-                selected == Some(stash.index),
-            ));
+            items.push(stash_row(stash, selected == Some(stash.index)));
         }
     }
 
@@ -1231,9 +1271,8 @@ fn stashes_list(app: &App) -> Element<'_, Message> {
 }
 
 /// One saved stash: a click target (its description and `stash@{N}` ref) that
-/// shows the stash's Diff, plus Pop / Apply / Drop actions. Drop first arms a
-/// confirmation, then performs it.
-fn stash_row<'a>(stash: &StashInfo, armed: bool, selected: bool) -> Element<'a, Message> {
+/// shows the stash's Diff. Right-clicking opens its actions (Apply / Pop / Drop).
+fn stash_row<'a>(stash: &StashInfo, selected: bool) -> Element<'a, Message> {
     let index = stash.index;
     let label = button(
         column![
@@ -1250,27 +1289,9 @@ fn stash_row<'a>(stash: &StashInfo, armed: bool, selected: bool) -> Element<'a, 
     .padding([4, 8])
     .style(style::file_item(selected));
 
-    let pop = button(text("Pop").size(11))
-        .on_press(Message::Git(GitMessage::StashPop(index)))
-        .padding([3, 8])
-        .style(style::secondary);
-    let apply = button(text("Apply").size(11))
-        .on_press(Message::Git(GitMessage::StashApply(index)))
-        .padding([3, 8])
-        .style(style::secondary);
-    let drop = button(text(if armed { "Drop?" } else { "Drop" }).size(11))
-        .on_press(Message::Git(GitMessage::StashDrop(index)))
-        .padding([3, 8])
-        .style(style::secondary_danger);
-
-    container(
-        row![label, pop, apply, drop]
-            .spacing(5)
-            .align_y(Center),
-    )
-    .padding([4, 6])
-    .width(Fill)
-    .into()
+    mouse_area(container(label).padding([4, 6]).width(Fill))
+        .on_right_press(Message::Ui(UiMessage::OpenMenu(MenuTarget::Stash { index })))
+        .into()
 }
 
 /// The right panel in the Stashes view: the selected stash's Diff, or — when
@@ -1321,7 +1342,7 @@ fn stashes_detail(app: &App) -> Element<'_, Message> {
         text("Click a stash to view its contents")
             .size(12)
             .color(style::TEXT_FAINT),
-        text("Pop applies & removes · Apply keeps it · Drop deletes it")
+        text("Right-click for Apply / Pop / Drop")
             .size(12)
             .color(style::TEXT_FAINT),
     ]
@@ -1364,10 +1385,8 @@ fn tags_list(app: &App) -> Element<'_, Message> {
     if app.tags.tags.is_empty() {
         items.push(placeholder("No tags yet"));
     } else {
-        let armed = app.tags.delete_armed.as_deref();
-        let has_remote = app.repo.head.has_remote;
         for tag in &app.tags.tags {
-            items.push(tag_row(tag, armed == Some(tag.name.as_str()), has_remote));
+            items.push(tag_row(tag));
         }
     }
 
@@ -1376,10 +1395,9 @@ fn tags_list(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// One tag: its name and a tag/annotation marker, the target Commit it points
-/// at, and — stacked at the right — Push (when a Remote exists) and Delete
-/// actions. Delete first arms a confirmation, then performs it.
-fn tag_row<'a>(tag: &TagInfo, armed: bool, has_remote: bool) -> Element<'a, Message> {
+/// One tag: a tag/annotation marker, its name, and the target Commit it points
+/// at. Right-clicking opens its actions (Push / Delete).
+fn tag_row<'a>(tag: &TagInfo) -> Element<'a, Message> {
     let marker_color = if tag.is_annotated {
         style::ACCENT
     } else {
@@ -1400,25 +1418,10 @@ fn tag_row<'a>(tag: &TagInfo, armed: bool, has_remote: bool) -> Element<'a, Mess
     .spacing(2)
     .width(Fill);
 
-    let label = container(label).padding([4, 8]).width(Fill);
-
-    let mut actions = row![].spacing(2).align_y(Center);
-    if has_remote {
-        let push = button(text("Push").size(11))
-            .on_press(Message::Git(GitMessage::PushTag(tag.name.clone())))
-            .padding([4, 8])
-            .style(style::ghost);
-        actions = actions.push(push);
-    }
-    let delete = button(text(if armed { "Confirm?" } else { "✕" }).size(if armed { 11 } else { 13 }))
-        .on_press(Message::Git(GitMessage::DeleteTag(tag.name.clone())))
-        .padding([4, 8])
-        .style(style::ghost_danger);
-    actions = actions.push(delete);
-
-    container(row![label, actions].spacing(5).align_y(Center))
-        .padding([4, 6])
-        .width(Fill)
+    mouse_area(container(label).padding([4, 8]).width(Fill))
+        .on_right_press(Message::Ui(UiMessage::OpenMenu(MenuTarget::Tag {
+            name: tag.name.clone(),
+        })))
         .into()
 }
 
@@ -1435,7 +1438,7 @@ fn tags_detail(app: &App) -> Element<'_, Message> {
         text("Create a tag at the current commit (HEAD)")
             .size(12)
             .color(style::TEXT_FAINT),
-        text("A message makes it annotated · Push to publish · ✕ to delete")
+        text("A message makes it annotated · right-click for Push / Delete")
             .size(12)
             .color(style::TEXT_FAINT),
     ]
