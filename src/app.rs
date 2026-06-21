@@ -15,6 +15,7 @@ use iced::{Subscription, Task};
 
 use crate::git::{
     self, BranchInfo, CommitDetail, CommitInfo, Diff, FileEntry, GitCommand, GitEvent, HeadInfo,
+    StashDiff, StashInfo,
 };
 use crate::ui;
 
@@ -41,6 +42,8 @@ pub enum ViewMode {
     History,
     /// The local branches: list, switch, create, and delete.
     Branches,
+    /// The saved stashes: list, apply, pop, and drop.
+    Stashes,
 }
 
 /// The application root state.
@@ -51,6 +54,7 @@ pub struct App {
     pub commit: CommitState,
     pub history: HistoryState,
     pub branches: BranchesState,
+    pub stashes: StashesState,
     /// Which left-column view is active.
     pub view: ViewMode,
     pub status: StatusBar,
@@ -87,6 +91,20 @@ pub struct BranchesState {
     pub delete_armed: Option<String>,
     /// Whether Prune is armed, awaiting a confirming second press.
     pub prune_armed: bool,
+}
+
+/// The Stashes view's state: the loaded stashes, the in-progress stash message,
+/// and which stash (if any) is armed for a confirming drop.
+#[derive(Default)]
+pub struct StashesState {
+    pub stashes: Vec<StashInfo>,
+    pub message: String,
+    /// The stash index awaiting a confirming second Drop press, if any.
+    pub drop_armed: Option<usize>,
+    /// The stash whose Diff is shown in the detail panel, if any.
+    pub selected: Option<usize>,
+    /// The loaded Diff of the selected stash.
+    pub diff: Option<StashDiff>,
 }
 
 /// Working Tree and Staging Area contents, the HEAD/branch context, the
@@ -208,6 +226,10 @@ pub enum UiMessage {
     CommitSelected(String),
     /// The new-branch name field changed.
     NewBranchNameChanged(String),
+    /// The stash message field changed.
+    StashMessageChanged(String),
+    /// Select a stash in the Stashes view and load its Diff.
+    StashSelected(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +269,17 @@ pub enum GitMessage {
     Pull,
     /// Update remote-tracking branches from the Remote without merging.
     Fetch,
+    /// Stash the checked files (or all of them if none are checked).
+    Stash,
+    /// Stash every change, with the stash message field as its label.
+    StashAll,
+    /// Apply the stash at the given index, keeping it in the list.
+    StashApply(usize),
+    /// Apply the stash at the given index and remove it.
+    StashPop(usize),
+    /// Drop the stash at the given index. First press arms a confirmation; the
+    /// second performs it.
+    StashDrop(usize),
 }
 
 impl App {
@@ -257,6 +290,7 @@ impl App {
             commit: CommitState::default(),
             history: HistoryState::default(),
             branches: BranchesState::default(),
+            stashes: StashesState::default(),
             view: ViewMode::default(),
             status: StatusBar::default(),
             notification: Notification::default(),
@@ -287,11 +321,12 @@ impl App {
     }
 
     fn update_ui(&mut self, message: UiMessage) {
-        // Interacting elsewhere cancels a pending Discard, branch-delete, or
-        // prune confirmation.
+        // Interacting elsewhere cancels a pending Discard, branch-delete,
+        // prune, or stash-drop confirmation.
         self.discard_armed = false;
         self.branches.delete_armed = None;
         self.branches.prune_armed = false;
+        self.stashes.drop_armed = None;
 
         match message {
             UiMessage::FileSelected { path, staged } => self.select(path, staged),
@@ -323,7 +358,16 @@ impl App {
             UiMessage::ShowView(view) => self.show_view(view),
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
             UiMessage::NewBranchNameChanged(name) => self.branches.new_name = name,
+            UiMessage::StashMessageChanged(message) => self.stashes.message = message,
+            UiMessage::StashSelected(index) => self.select_stash(index),
         }
+    }
+
+    /// Select a stash and request its Diff for the detail panel.
+    fn select_stash(&mut self, index: usize) {
+        self.stashes.selected = Some(index);
+        self.stashes.diff = None;
+        self.dispatch(GitCommand::LoadStashDiff(index));
     }
 
     /// Switch the left-column view, (re)loading the data that view needs.
@@ -332,6 +376,7 @@ impl App {
         match view {
             ViewMode::History => self.dispatch(GitCommand::LoadHistory),
             ViewMode::Branches => self.dispatch(GitCommand::LoadBranches),
+            ViewMode::Stashes => self.dispatch(GitCommand::LoadStashes),
             ViewMode::Changes => {}
         }
     }
@@ -357,6 +402,10 @@ impl App {
         // And anything but pressing Prune again cancels an armed prune.
         if !matches!(message, GitMessage::PruneBranches) {
             self.branches.prune_armed = false;
+        }
+        // And anything but re-pressing the same Drop cancels an armed stash drop.
+        if !matches!(message, GitMessage::StashDrop(_)) {
+            self.stashes.drop_armed = None;
         }
 
         match message {
@@ -460,6 +509,37 @@ impl App {
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
             GitMessage::Fetch => self.start_remote("Fetching…", GitCommand::Fetch),
+            GitMessage::Stash => {
+                // Stash the checked files (deduped across both sides); with none
+                // checked, `paths` is empty and everything is stashed.
+                let mut paths: Vec<String> =
+                    self.checked.iter().map(|item| item.path.clone()).collect();
+                paths.sort();
+                paths.dedup();
+                self.dispatch(GitCommand::StashPush {
+                    message: None,
+                    paths,
+                });
+            }
+            GitMessage::StashAll => {
+                let message = self.stashes.message.trim();
+                let message = (!message.is_empty()).then(|| message.to_string());
+                self.dispatch(GitCommand::StashPush {
+                    message,
+                    paths: vec![],
+                });
+            }
+            GitMessage::StashApply(index) => self.dispatch(GitCommand::StashApply(index)),
+            GitMessage::StashPop(index) => self.dispatch(GitCommand::StashPop(index)),
+            GitMessage::StashDrop(index) => {
+                // First press arms this stash; the confirming second drops it.
+                if self.stashes.drop_armed == Some(index) {
+                    self.stashes.drop_armed = None;
+                    self.dispatch(GitCommand::StashDrop(index));
+                } else {
+                    self.stashes.drop_armed = Some(index);
+                }
+            }
         }
     }
 
@@ -615,6 +695,29 @@ impl App {
             GitEvent::Fetched => {
                 self.operation = None;
                 self.notify("Fetched from remote".to_string());
+            }
+            GitEvent::StashesLoaded(stashes) => {
+                self.stashes.stashes = stashes;
+                // The list was (re)loaded, so any pending confirmation or shown
+                // Diff may now point at a different or vanished stash: reset both.
+                self.stashes.drop_armed = None;
+                self.stashes.selected = None;
+                self.stashes.diff = None;
+            }
+            GitEvent::StashDiffLoaded(diff) => {
+                // Ignore a Diff that no longer matches the selection.
+                if self.stashes.selected == Some(diff.index) {
+                    self.stashes.diff = Some(diff);
+                }
+            }
+            GitEvent::Stashed => {
+                self.stashes.message.clear();
+                self.notify("Stashed changes".to_string());
+            }
+            GitEvent::StashApplied => self.notify("Applied stash".to_string()),
+            GitEvent::StashDropped => {
+                self.stashes.drop_armed = None;
+                self.notify("Dropped stash".to_string());
             }
             GitEvent::Error(error) => {
                 self.commit.committing = false;
@@ -853,6 +956,7 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Character("1") if command => Message::Ui(UiMessage::ShowView(ViewMode::Changes)),
         Key::Character("2") if command => Message::Ui(UiMessage::ShowView(ViewMode::History)),
         Key::Character("3") if command => Message::Ui(UiMessage::ShowView(ViewMode::Branches)),
+        Key::Character("4") if command => Message::Ui(UiMessage::ShowView(ViewMode::Stashes)),
         Key::Named(Named::F5) => Message::Git(GitMessage::Refresh),
         Key::Character("r") if command => Message::Git(GitMessage::Refresh),
         Key::Named(Named::Enter) if command => Message::Git(GitMessage::Commit),
@@ -1096,6 +1200,23 @@ mod tests {
         // Second press fires and disarms.
         update(&mut app, Message::Git(GitMessage::DiscardChecked));
         assert!(!app.discard_armed);
+    }
+
+    #[test]
+    fn stash_drop_requires_a_confirming_second_press_on_the_same_stash() {
+        let mut app = App::new();
+
+        // First press arms that stash index.
+        update(&mut app, Message::Git(GitMessage::StashDrop(1)));
+        assert_eq!(app.stashes.drop_armed, Some(1));
+
+        // A different stash's Drop re-arms rather than firing.
+        update(&mut app, Message::Git(GitMessage::StashDrop(2)));
+        assert_eq!(app.stashes.drop_armed, Some(2));
+
+        // Re-pressing the armed one fires and disarms.
+        update(&mut app, Message::Git(GitMessage::StashDrop(2)));
+        assert_eq!(app.stashes.drop_armed, None);
     }
 
     #[test]

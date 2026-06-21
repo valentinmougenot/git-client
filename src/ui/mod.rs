@@ -20,6 +20,7 @@ use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Righ
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
 use crate::git::{
     BranchInfo, ChangeKind, CommitInfo, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo,
+    StashInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -34,6 +35,7 @@ pub fn root(app: &App) -> Element<'_, Message> {
         ViewMode::Changes => file_list(app),
         ViewMode::History => history_list(&app.history),
         ViewMode::Branches => branches_list(app),
+        ViewMode::Stashes => stashes_list(app),
     };
     let left = container(column![view_tabs(app), left_body])
         .style(style::panel)
@@ -63,6 +65,11 @@ pub fn root(app: &App) -> Element<'_, Message> {
             .width(Length::FillPortion(3))
             .height(Fill)
             .into(),
+        ViewMode::Stashes => container(stashes_detail(app))
+            .style(style::panel)
+            .width(Length::FillPortion(3))
+            .height(Fill)
+            .into(),
     };
 
     let body = row![left, right].spacing(12).height(Fill);
@@ -85,11 +92,18 @@ fn view_tabs(app: &App) -> Element<'_, Message> {
     } else {
         "Changes".to_string()
     };
+    let stashes_count = app.stashes.stashes.len();
+    let stashes_label = if stashes_count > 0 {
+        format!("Stashes ({stashes_count})")
+    } else {
+        "Stashes".to_string()
+    };
 
     let tabs = row![
         tab(&changes_label, ViewMode::Changes, app.view),
         tab("History", ViewMode::History, app.view),
         tab("Branches", ViewMode::Branches, app.view),
+        tab(&stashes_label, ViewMode::Stashes, app.view),
     ]
     .spacing(4);
 
@@ -370,7 +384,20 @@ fn action_toolbar(app: &App) -> Element<'_, Message> {
         !app.repo.unstaged.is_empty(),
     );
 
-    container(row![stage, unstage, discard].spacing(6).align_y(Center))
+    // Stash acts on the checked files (deduped across both sides), or on
+    // everything when nothing is checked — mirroring the other bulk actions.
+    let checked_paths: std::collections::HashSet<&str> =
+        app.checked.iter().map(|s| s.path.as_str()).collect();
+    let has_changes = !app.repo.unstaged.is_empty() || !app.repo.staged.is_empty();
+    let stash_label = match checked_paths.len() {
+        0 => "Stash all".to_string(),
+        n => format!("Stash ({n})"),
+    };
+    let stash = pill("", 15, &stash_label, GitMessage::Stash, Tone::Normal, has_changes);
+
+    // Two rows: the staging actions, then Stash — they do not all fit on one.
+    let row1 = row![stage, unstage, discard].spacing(6).align_y(Center);
+    container(column![row1, row![stash]].spacing(6))
         .padding([2, 0])
         .into()
 }
@@ -960,6 +987,148 @@ fn branches_detail(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+// ── Stashes List ──────────────────────────────────────────────────────────
+
+/// The left column in the Stashes view: a "stash all changes" field and button
+/// at the top, then the saved stashes, newest first. (Stashing only selected
+/// files is done from the Changes view, where the checkboxes live.)
+fn stashes_list(app: &App) -> Element<'_, Message> {
+    let mut items: Vec<Element<Message>> = Vec::new();
+
+    let has_changes = !app.repo.unstaged.is_empty() || !app.repo.staged.is_empty();
+    let input = text_input("Message — stash all changes", &app.stashes.message)
+        .on_input(|value| Message::Ui(UiMessage::StashMessageChanged(value)))
+        .on_submit(Message::Git(GitMessage::StashAll))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let stash = pill("", 15, "Stash all", GitMessage::StashAll, Tone::Normal, has_changes);
+    items.push(row![input, stash].spacing(6).align_y(Center).into());
+
+    items.push(gap(8.0));
+    items.push(branch_section_label("STASHES", app.stashes.stashes.len()));
+    if app.stashes.stashes.is_empty() {
+        items.push(placeholder("No stashes"));
+    } else {
+        let armed = app.stashes.drop_armed;
+        let selected = app.stashes.selected;
+        for stash in &app.stashes.stashes {
+            items.push(stash_row(
+                stash,
+                armed == Some(stash.index),
+                selected == Some(stash.index),
+            ));
+        }
+    }
+
+    scrollable(column(items).spacing(4).padding(12))
+        .height(Fill)
+        .into()
+}
+
+/// One saved stash: a click target (its description and `stash@{N}` ref) that
+/// shows the stash's Diff, plus Pop / Apply / Drop actions. Drop first arms a
+/// confirmation, then performs it.
+fn stash_row<'a>(stash: &StashInfo, armed: bool, selected: bool) -> Element<'a, Message> {
+    let index = stash.index;
+    let label = button(
+        column![
+            text(stash.message.clone()).size(14).color(style::TEXT),
+            text(format!("stash@{{{index}}}"))
+                .size(11)
+                .color(style::TEXT_FAINT),
+        ]
+        .spacing(2)
+        .width(Fill),
+    )
+    .on_press(Message::Ui(UiMessage::StashSelected(index)))
+    .width(Fill)
+    .padding([4, 8])
+    .style(style::file_item(selected));
+
+    let pop = button(text("Pop").size(11))
+        .on_press(Message::Git(GitMessage::StashPop(index)))
+        .padding([3, 8])
+        .style(style::secondary);
+    let apply = button(text("Apply").size(11))
+        .on_press(Message::Git(GitMessage::StashApply(index)))
+        .padding([3, 8])
+        .style(style::secondary);
+    let drop = button(text(if armed { "Drop?" } else { "Drop" }).size(11))
+        .on_press(Message::Git(GitMessage::StashDrop(index)))
+        .padding([3, 8])
+        .style(style::secondary_danger);
+
+    container(
+        row![label, pop, apply, drop]
+            .spacing(5)
+            .align_y(Center),
+    )
+    .padding([4, 6])
+    .width(Fill)
+    .into()
+}
+
+/// The right panel in the Stashes view: the selected stash's Diff, or — when
+/// nothing is selected — a short summary and usage hint.
+fn stashes_detail(app: &App) -> Element<'_, Message> {
+    let stashes = &app.stashes;
+
+    // A stash is selected: show its Diff (or a loading note while it arrives).
+    if let Some(index) = stashes.selected {
+        let message = stashes
+            .stashes
+            .iter()
+            .find(|s| s.index == index)
+            .map(|s| s.message.clone())
+            .unwrap_or_default();
+        let header = container(
+            column![
+                text(message).size(15).color(style::TEXT),
+                text(format!("stash@{{{index}}}"))
+                    .size(12)
+                    .font(Font::MONOSPACE)
+                    .color(style::INFO),
+            ]
+            .spacing(8),
+        )
+        .style(style::diff_header)
+        .padding([10, 12])
+        .width(Fill);
+
+        let body: Element<Message> = match &stashes.diff {
+            Some(diff) if diff.index == index => diff_body(&diff.lines),
+            _ => container(text("Loading…").size(14).color(style::TEXT_FAINT))
+                .center(Fill)
+                .into(),
+        };
+
+        return column![header, body].spacing(10).padding(12).into();
+    }
+
+    let title = match stashes.stashes.len() {
+        0 => "No stashes".to_string(),
+        1 => "1 stash".to_string(),
+        n => format!("{n} stashes"),
+    };
+
+    let lines = column![
+        text(title).size(16).color(style::TEXT),
+        text("Click a stash to view its contents")
+            .size(12)
+            .color(style::TEXT_FAINT),
+        text("Pop applies & removes · Apply keeps it · Drop deletes it")
+            .size(12)
+            .color(style::TEXT_FAINT),
+    ]
+    .spacing(8);
+
+    container(lines.align_x(Center))
+        .center(Fill)
+        .padding(12)
+        .into()
+}
+
 // ── Commit Detail ────────────────────────────────────────────────────────
 
 /// The right panel in the History view: the selected Commit's metadata, full
@@ -1002,12 +1171,20 @@ fn commit_detail_view(history: &HistoryState) -> Element<'_, Message> {
     .padding([10, 12])
     .width(Fill);
 
-    // The detail spans several files; track the current file (from the injected
-    // "● path" header lines) so each line is highlighted for its own language.
+    column![header, diff_body(&detail.lines)]
+        .spacing(10)
+        .padding(12)
+        .into()
+}
+
+/// Render a multi-file patch (`DiffLine`s with injected `● path` headers) as a
+/// scrollable, syntax-highlighted body. Shared by the Commit and Stash details.
+fn diff_body(lines: &[DiffLine]) -> Element<'_, Message> {
+    // Track the current file (from the injected "● path" header lines) so each
+    // line is highlighted for its own language.
     let mut lang = highlight::Lang::Plain;
-    let emphasis = intraline_emphasis(&detail.lines);
-    let rows: Vec<Element<Message>> = detail
-        .lines
+    let emphasis = intraline_emphasis(lines);
+    let rows: Vec<Element<Message>> = lines
         .iter()
         .enumerate()
         .map(|(idx, line)| {
@@ -1019,9 +1196,10 @@ fn commit_detail_view(history: &HistoryState) -> Element<'_, Message> {
             diff_line(line, lang, emphasis[idx].as_deref())
         })
         .collect();
-    let body = scrollable(column(rows).padding([8, 4])).height(Fill).width(Fill);
-
-    column![header, body].spacing(10).padding(12).into()
+    scrollable(column(rows).padding([8, 4]))
+        .height(Fill)
+        .width(Fill)
+        .into()
 }
 
 /// A coarse "time ago" label for a Unix timestamp (seconds).

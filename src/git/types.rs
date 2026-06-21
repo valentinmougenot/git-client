@@ -59,6 +59,24 @@ pub enum GitCommand {
     Pull,
     /// Update the remote-tracking branches from `origin` without merging.
     Fetch,
+    /// Load the saved stashes, newest (stash@{0}) first.
+    LoadStashes,
+    /// Save the Working Tree and Staging Area as a new stash, including untracked
+    /// files. When `paths` is non-empty only those paths are stashed; otherwise
+    /// everything is. A `message` is honoured only for a full stash (libgit2 has
+    /// no way to set one on a path-limited stash).
+    StashPush {
+        message: Option<String>,
+        paths: Vec<String>,
+    },
+    /// Load the Diff of the stash at the given index (its changes vs its base).
+    LoadStashDiff(usize),
+    /// Apply the stash at the given index without removing it.
+    StashApply(usize),
+    /// Apply the stash at the given index and remove it from the list.
+    StashPop(usize),
+    /// Remove the stash at the given index without applying it.
+    StashDrop(usize),
 }
 
 /// The result of a completed [`GitCommand`], sent from the Git Worker to the UI.
@@ -93,6 +111,16 @@ pub enum GitEvent {
     Pulled,
     /// A Fetch completed successfully.
     Fetched,
+    /// The saved stashes, newest first.
+    StashesLoaded(Vec<StashInfo>),
+    /// The Diff of one stash, for the detail panel.
+    StashDiffLoaded(StashDiff),
+    /// Changes were saved to a new stash.
+    Stashed,
+    /// A stash was applied (with or without being dropped).
+    StashApplied,
+    /// A stash was dropped without being applied.
+    StashDropped,
     /// Any operation failed.
     Error(GitError),
 }
@@ -144,6 +172,24 @@ pub struct BranchInfo {
     pub ahead: usize,
     /// Commits behind the upstream.
     pub behind: usize,
+}
+
+/// One saved stash in the Stashes view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashInfo {
+    /// Position in the stash list, i.e. the `N` in `stash@{N}`. Used to apply,
+    /// pop, or drop it. Index 0 is the most recent.
+    pub index: usize,
+    /// The stash's description, e.g. `WIP on main: 1a2b3c add feature`.
+    pub message: String,
+}
+
+/// The Diff of one stash (its changes against its base commit), for the detail
+/// panel. A header line is injected before each changed file, like a commit's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashDiff {
+    pub index: usize,
+    pub lines: Vec<DiffLine>,
 }
 
 /// One row in the History view: enough to list a Commit.

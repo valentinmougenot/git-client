@@ -8,7 +8,7 @@ use std::sync::mpsc::Receiver;
 
 use git2::{
     ApplyLocation, ApplyOptions, Cred, CredentialType, DiffFormat, DiffOptions, FetchOptions,
-    ObjectType, PushOptions, RemoteCallbacks, Repository, Status, StatusOptions,
+    ObjectType, PushOptions, RemoteCallbacks, Repository, StashFlags, Status, StatusOptions,
 };
 
 use super::types::*;
@@ -196,6 +196,44 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             // counts, so refresh both the status context and the branch list.
             emit_status(repo, events);
             emit_branches(repo, events);
+        }
+        GitCommand::LoadStashes => emit_stashes(repo, events),
+        GitCommand::StashPush { message, paths } => {
+            match stash_push(repo, message.as_deref(), &paths) {
+                Ok(()) => events.emit(GitEvent::Stashed),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // Stashing clears the Working Tree, so refresh the file lists too.
+            emit_status(repo, events);
+            emit_stashes(repo, events);
+        }
+        GitCommand::LoadStashDiff(index) => match load_stash_diff(repo, index) {
+            Ok(diff) => events.emit(GitEvent::StashDiffLoaded(diff)),
+            Err(error) => events.emit(GitEvent::Error(error)),
+        },
+        GitCommand::StashApply(index) => {
+            match stash_apply(repo, index) {
+                Ok(()) => events.emit(GitEvent::StashApplied),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // Applying restores changes to the Working Tree (the stash remains).
+            emit_status(repo, events);
+        }
+        GitCommand::StashPop(index) => {
+            match stash_pop(repo, index) {
+                Ok(()) => events.emit(GitEvent::StashApplied),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // A pop both restores the changes and removes the stash.
+            emit_status(repo, events);
+            emit_stashes(repo, events);
+        }
+        GitCommand::StashDrop(index) => {
+            match stash_drop(repo, index) {
+                Ok(()) => events.emit(GitEvent::StashDropped),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_stashes(repo, events);
         }
     }
 }
@@ -615,47 +653,10 @@ fn load_diff(repo: &Repository, path: &str, staged: bool) -> Result<Diff, git2::
 /// How many recent Commits the History view loads.
 const HISTORY_LIMIT: usize = 200;
 
-/// Walk the Commit history from HEAD, newest first, up to `limit` entries.
-/// Returns an empty list when the branch is unborn (no commits yet).
-fn load_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, git2::Error> {
-    let mut walk = repo.revwalk()?;
-    if walk.push_head().is_err() {
-        return Ok(Vec::new());
-    }
-    // Topological ordering (with time as the tie-breaker) guarantees a Commit is
-    // always listed before its parents, which the graph layout relies on.
-    walk.set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)?;
-
-    let mut commits = Vec::new();
-    for oid in walk.take(limit) {
-        let oid = oid?;
-        let commit = repo.find_commit(oid)?;
-        commits.push(CommitInfo {
-            short_sha: short_sha(oid),
-            sha: oid.to_string(),
-            summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
-            author: commit.author().name().unwrap_or_default().to_string(),
-            time: commit.time().seconds(),
-            parents: commit.parent_ids().map(|id| id.to_string()).collect(),
-        });
-    }
-    Ok(commits)
-}
-
-/// Load one Commit's metadata and its full Diff against its first parent (or
-/// against the empty tree for a root Commit). A header line is injected before
-/// each changed file so the combined patch reads clearly in the Diff View.
-fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2::Error> {
-    let oid = git2::Oid::from_str(sha)?;
-    let commit = repo.find_commit(oid)?;
-    let tree = commit.tree()?;
-    let parent_tree = match commit.parent(0) {
-        Ok(parent) => Some(parent.tree()?),
-        Err(_) => None,
-    };
-
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
-
+/// Render a git2 Diff into our `DiffLine`s, injecting a `● <path>` header line
+/// before each changed file so a multi-file patch reads clearly. Shared by the
+/// Commit detail and the Stash detail.
+fn diff_to_lines(diff: &git2::Diff) -> Result<Vec<DiffLine>, git2::Error> {
     let mut lines = Vec::new();
     let mut last_path: Option<String> = None;
     diff.print(DiffFormat::Patch, |delta, _hunk, line| {
@@ -697,6 +698,50 @@ fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2
         });
         true
     })?;
+    Ok(lines)
+}
+
+/// Walk the Commit history from HEAD, newest first, up to `limit` entries.
+/// Returns an empty list when the branch is unborn (no commits yet).
+fn load_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, git2::Error> {
+    let mut walk = repo.revwalk()?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    // Topological ordering (with time as the tie-breaker) guarantees a Commit is
+    // always listed before its parents, which the graph layout relies on.
+    walk.set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)?;
+
+    let mut commits = Vec::new();
+    for oid in walk.take(limit) {
+        let oid = oid?;
+        let commit = repo.find_commit(oid)?;
+        commits.push(CommitInfo {
+            short_sha: short_sha(oid),
+            sha: oid.to_string(),
+            summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
+            author: commit.author().name().unwrap_or_default().to_string(),
+            time: commit.time().seconds(),
+            parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+        });
+    }
+    Ok(commits)
+}
+
+/// Load one Commit's metadata and its full Diff against its first parent (or
+/// against the empty tree for a root Commit). A header line is injected before
+/// each changed file so the combined patch reads clearly in the Diff View.
+fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2::Error> {
+    let oid = git2::Oid::from_str(sha)?;
+    let commit = repo.find_commit(oid)?;
+    let tree = commit.tree()?;
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    let lines = diff_to_lines(&diff)?;
 
     let author = commit.author();
     Ok(CommitDetail {
@@ -835,6 +880,171 @@ fn emit_branches(repo: &Repository, events: &impl EventSink) {
         Ok(branches) => events.emit(GitEvent::BranchesLoaded(branches)),
         Err(error) => events.emit(GitEvent::Error(GitError::new("load branches", &error))),
     }
+}
+
+/// Load the stashes and emit them, or surface the failure.
+fn emit_stashes(repo: &Repository, events: &impl EventSink) {
+    match load_stashes(repo) {
+        Ok(stashes) => events.emit(GitEvent::StashesLoaded(stashes)),
+        Err(error) => events.emit(GitEvent::Error(error)),
+    }
+}
+
+// git2's stash operations all need a `&mut Repository`, but the worker holds a
+// shared `&Repository`. Opening a fresh handle to the same on-disk repo for the
+// duration of one stash call is safe here: the worker is single-threaded and
+// processes commands sequentially, so the two handles are never used at once.
+fn open_mut(repo: &Repository) -> Result<Repository, GitError> {
+    Repository::open(repo.path()).map_err(|error| GitError::new("open repository", &error))
+}
+
+/// List the saved stashes, newest (`stash@{0}`) first.
+fn load_stashes(repo: &Repository) -> Result<Vec<StashInfo>, GitError> {
+    let mut repo = open_mut(repo)?;
+    let mut stashes = Vec::new();
+    repo.stash_foreach(|index, message, _oid| {
+        stashes.push(StashInfo {
+            index,
+            message: message.to_string(),
+        });
+        true
+    })
+    .map_err(|error| GitError::new("load stashes", &error))?;
+    Ok(stashes)
+}
+
+/// Save the Working Tree and Staging Area as a new stash (including untracked
+/// files). When `paths` is empty, stash everything and honour `message`.
+///
+/// When `paths` are given, stash only those. libgit2's path-limited stash does
+/// not work through git2 0.21, so this is done by hand: snapshot the *other*
+/// changed files, revert them to HEAD so only the chosen changes remain, stash
+/// that, then restore the snapshots. (A selective stash carries no message, and
+/// the kept files come back unstaged.)
+fn stash_push(repo: &Repository, message: Option<&str>, paths: &[String]) -> Result<(), GitError> {
+    let mut repo = open_mut(repo)?;
+    let make = |error: &git2::Error| GitError::new("stash", error);
+
+    if paths.is_empty() {
+        let signature = repo.signature().map_err(|e| make(&e))?;
+        repo.stash_save2(&signature, message, Some(StashFlags::INCLUDE_UNTRACKED))
+            .map_err(|e| make(&e))?;
+        return Ok(());
+    }
+
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::custom("stash", "no working directory"))?
+        .to_path_buf();
+    let selected: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+
+    // The other changed files (path, is_untracked) — everything we must keep out
+    // of the stash and restore afterwards.
+    let (unstaged, staged) = status(&repo).map_err(|e| make(&e))?;
+    let mut kept: Vec<(String, bool)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in unstaged.iter().chain(staged.iter()) {
+        if selected.contains(entry.path.as_str()) || !seen.insert(entry.path.clone()) {
+            continue;
+        }
+        let untracked = unstaged
+            .iter()
+            .any(|e| e.path == entry.path && e.change == ChangeKind::Untracked);
+        kept.push((entry.path.clone(), untracked));
+    }
+
+    // Snapshot the kept files' working-tree content (None = absent on disk).
+    let snapshots: Vec<(String, Option<Vec<u8>>)> = kept
+        .iter()
+        .map(|(path, _)| (path.clone(), std::fs::read(workdir.join(path)).ok()))
+        .collect();
+
+    // Revert the kept files so the Working Tree holds only the selected changes:
+    // delete untracked ones, check the rest out from HEAD (index and workdir).
+    for (path, untracked) in &kept {
+        if *untracked {
+            let _ = std::fs::remove_file(workdir.join(path));
+        } else {
+            let mut checkout = git2::build::CheckoutBuilder::new();
+            checkout.force().path(path.as_str());
+            repo.checkout_head(Some(&mut checkout)).map_err(|e| make(&e))?;
+        }
+    }
+
+    // Stash the remaining (selected) changes.
+    let result = repo
+        .signature()
+        .and_then(|sig| repo.stash_save2(&sig, None, Some(StashFlags::INCLUDE_UNTRACKED)));
+
+    // Restore the kept files' content whatever happened, so a failed stash never
+    // loses the changes we set aside.
+    for (path, content) in snapshots {
+        let full = workdir.join(&path);
+        match content {
+            Some(bytes) => {
+                let _ = std::fs::write(full, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+    }
+
+    result.map(|_| ()).map_err(|e| make(&e))
+}
+
+/// The Diff of the stash at `index`: its changes against its base commit (the
+/// stash's first parent), the same view as `git stash show -p`.
+fn load_stash_diff(repo: &Repository, index: usize) -> Result<StashDiff, GitError> {
+    // Resolve the index to the stash commit's oid via the stash list.
+    let mut oid = None;
+    {
+        let mut repo = open_mut(repo)?;
+        repo.stash_foreach(|i, _message, id| {
+            if i == index {
+                oid = Some(*id);
+                false
+            } else {
+                true
+            }
+        })
+        .map_err(|error| GitError::new("load stash", &error))?;
+    }
+    let oid = oid.ok_or_else(|| GitError::custom("load stash", "no such stash"))?;
+
+    let make = |error: &git2::Error| GitError::new("load stash", error);
+    let commit = repo.find_commit(oid).map_err(|e| make(&e))?;
+    let tree = commit.tree().map_err(|e| make(&e))?;
+    let base_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree().map_err(|e| make(&e))?),
+        Err(_) => None,
+    };
+    let diff = repo
+        .diff_tree_to_tree(base_tree.as_ref(), Some(&tree), None)
+        .map_err(|e| make(&e))?;
+    let lines = diff_to_lines(&diff).map_err(|e| make(&e))?;
+    Ok(StashDiff { index, lines })
+}
+
+/// Restore the stash at `index` to the Working Tree, leaving it in the list.
+fn stash_apply(repo: &Repository, index: usize) -> Result<(), GitError> {
+    let mut repo = open_mut(repo)?;
+    repo.stash_apply(index, None)
+        .map_err(|error| GitError::new("apply stash", &error))
+}
+
+/// Restore the stash at `index` and remove it from the list.
+fn stash_pop(repo: &Repository, index: usize) -> Result<(), GitError> {
+    let mut repo = open_mut(repo)?;
+    repo.stash_pop(index, None)
+        .map_err(|error| GitError::new("pop stash", &error))
+}
+
+/// Remove the stash at `index` without restoring it.
+fn stash_drop(repo: &Repository, index: usize) -> Result<(), GitError> {
+    let mut repo = open_mut(repo)?;
+    repo.stash_drop(index)
+        .map_err(|error| GitError::new("drop stash", &error))
 }
 
 /// List the branches: local ones first (current branch first, then by name),
@@ -1145,6 +1355,19 @@ mod tests {
                     _ => None,
                 })
                 .expect("expected a BranchesLoaded event")
+        }
+
+        /// The stash list from the most recent `StashesLoaded`.
+        fn last_stashes(&self) -> Vec<StashInfo> {
+            self.0
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    GitEvent::StashesLoaded(stashes) => Some(stashes.clone()),
+                    _ => None,
+                })
+                .expect("expected a StashesLoaded event")
         }
     }
 
@@ -1800,4 +2023,170 @@ mod tests {
                 .any(|e| matches!(e, GitEvent::Error(_)))
         );
     }
+
+    #[test]
+    fn stash_push_sets_aside_changes_and_pop_restores_them() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+
+        // Modify the tracked file, then stash it.
+        write(dir.path(), "a.txt", "two\n");
+        process(&repo, GitCommand::StashPush { message: Some("wip".into()), paths: vec![] }, &events);
+
+        // The Working Tree is clean and the stash is listed.
+        let (unstaged, staged) = events.last_status();
+        assert!(unstaged.is_empty() && staged.is_empty());
+        let stashes = events.last_stashes();
+        assert_eq!(stashes.len(), 1);
+        assert_eq!(stashes[0].index, 0);
+
+        // Popping restores the change and empties the stash list.
+        process(&repo, GitCommand::StashPop(0), &events);
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "two\n");
+        assert!(events.last_stashes().is_empty());
+    }
+
+    #[test]
+    fn stash_push_includes_untracked_files() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+
+        // A brand-new untracked file is stashed away too.
+        write(dir.path(), "new.txt", "fresh\n");
+        process(&repo, GitCommand::StashPush { message: None, paths: vec![] }, &events);
+
+        assert!(!dir.path().join("new.txt").exists());
+        process(&repo, GitCommand::StashPop(0), &events);
+        assert!(dir.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn stash_drop_removes_a_stash_without_restoring_it() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+
+        write(dir.path(), "a.txt", "two\n");
+        process(&repo, GitCommand::StashPush { message: Some("wip".into()), paths: vec![] }, &events);
+        assert_eq!(events.last_stashes().len(), 1);
+
+        // Dropping clears the stash but does not bring the change back.
+        process(&repo, GitCommand::StashDrop(0), &events);
+        assert!(events.last_stashes().is_empty());
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn stash_apply_keeps_the_stash_in_the_list() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+
+        write(dir.path(), "a.txt", "two\n");
+        process(&repo, GitCommand::StashPush { message: Some("wip".into()), paths: vec![] }, &events);
+
+        // Apply restores the change but leaves the stash present.
+        process(&repo, GitCommand::StashApply(0), &events);
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "two\n");
+        process(&repo, GitCommand::LoadStashes, &events);
+        assert_eq!(events.last_stashes().len(), 1);
+    }
+
+    #[test]
+    fn stash_push_with_paths_stashes_only_the_listed_files() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        commit_file(dir.path(), &repo, &events, "b.txt", "one\n");
+
+        // Both files change, but only a.txt is stashed.
+        write(dir.path(), "a.txt", "two\n");
+        write(dir.path(), "b.txt", "two\n");
+        process(
+            &repo,
+            GitCommand::StashPush {
+                message: None,
+                paths: vec!["a.txt".into()],
+            },
+            &events,
+        );
+
+        // a.txt is restored to HEAD (stashed away); b.txt keeps its change.
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "two\n");
+        assert_eq!(events.last_stashes().len(), 1);
+    }
+
+    #[test]
+    fn selective_stash_keeps_unselected_modified_and_untracked_files() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        commit_file(dir.path(), &repo, &events, "b.txt", "one\n");
+
+        // a.txt modified (selected), b.txt modified + new.txt untracked (kept).
+        write(dir.path(), "a.txt", "two\n");
+        write(dir.path(), "b.txt", "two\n");
+        write(dir.path(), "new.txt", "fresh\n");
+        process(
+            &repo,
+            GitCommand::StashPush {
+                message: None,
+                paths: vec!["a.txt".into()],
+            },
+            &events,
+        );
+
+        // Only a.txt was stashed; the kept files survive untouched.
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "two\n");
+        assert_eq!(fs::read_to_string(dir.path().join("new.txt")).unwrap(), "fresh\n");
+
+        // Popping brings a.txt's change back without disturbing the rest.
+        process(&repo, GitCommand::StashPop(0), &events);
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "two\n");
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "two\n");
+        assert_eq!(fs::read_to_string(dir.path().join("new.txt")).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn load_stash_diff_reports_the_stashed_change() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+
+        write(dir.path(), "a.txt", "one\ntwo\n");
+        process(
+            &repo,
+            GitCommand::StashPush { message: Some("wip".into()), paths: vec![] },
+            &events,
+        );
+
+        process(&repo, GitCommand::LoadStashDiff(0), &events);
+        let diff = events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::StashDiffLoaded(diff) => Some(diff),
+                _ => None,
+            })
+            .expect("expected a StashDiffLoaded event");
+
+        assert_eq!(diff.index, 0);
+        // The added "two" line shows up as an addition, under a file header.
+        assert!(
+            diff.lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Addition && l.content.contains("two"))
+        );
+        assert!(
+            diff.lines
+                .iter()
+                .any(|l| l.kind == DiffLineKind::Header && l.content.contains("a.txt"))
+        );
+    }
 }
+
