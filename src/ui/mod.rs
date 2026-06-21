@@ -930,29 +930,40 @@ fn branch_row<'a>(branch: &BranchInfo, armed: bool, depth: usize) -> Element<'a,
         .padding([6, 8])
         .style(style::file_item(branch.is_head));
 
-    // The current branch and remote branches have no in-row delete.
-    if branch.is_head || branch.is_remote {
+    // The current branch is only ever a switch target's "you are here" — no
+    // in-row actions (you can't merge or delete the branch you're on).
+    if branch.is_head {
         return row![tree_indent(depth), select]
             .spacing(8)
             .align_y(Center)
             .into();
     }
 
-    // A quiet, borderless delete sitting inside the row's rectangle, right-
-    // aligned. Stacked over the switch button so its own clicks are caught while
-    // the rest of the row still triggers the checkout beneath it.
-    let delete = button(text(if armed { "Confirm?" } else { "✕" }).size(if armed { 11 } else { 13 }))
-        .on_press(Message::Git(GitMessage::DeleteBranch(branch.name.clone())))
+    // Quiet, borderless actions sitting inside the row's rectangle, right-
+    // aligned and stacked over the switch button so their own clicks are caught
+    // while the rest of the row still triggers the checkout beneath them. Merge
+    // is offered for any other branch (local or remote); Delete only for locals.
+    let merge = button(text("Merge").size(11))
+        .on_press(Message::Git(GitMessage::Merge(branch.name.clone())))
         .padding([4, 8])
-        .style(style::ghost_danger);
-    let delete = container(delete)
+        .style(style::ghost);
+    let mut actions = row![merge].spacing(2).align_y(Center);
+    if !branch.is_remote {
+        let delete =
+            button(text(if armed { "Confirm?" } else { "✕" }).size(if armed { 11 } else { 13 }))
+                .on_press(Message::Git(GitMessage::DeleteBranch(branch.name.clone())))
+                .padding([4, 8])
+                .style(style::ghost_danger);
+        actions = actions.push(delete);
+    }
+    let actions = container(actions)
         .width(Fill)
         .height(Fill)
         .align_x(Right)
         .center_y(Fill)
         .padding([0, 6]);
 
-    row![tree_indent(depth), stack![select, delete]]
+    row![tree_indent(depth), stack![select, actions]]
         .spacing(8)
         .align_y(Center)
         .into()
@@ -976,7 +987,7 @@ fn branches_detail(app: &App) -> Element<'_, Message> {
         );
     }
     lines = lines.push(
-        text("Click a branch to switch to it · ✕ to delete · Create above")
+        text("Click a branch to switch · Merge into current · ✕ to delete")
             .size(12)
             .color(style::TEXT_FAINT),
     );

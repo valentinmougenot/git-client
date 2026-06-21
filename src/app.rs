@@ -15,7 +15,7 @@ use iced::{Subscription, Task};
 
 use crate::git::{
     self, BranchInfo, CommitDetail, CommitInfo, Diff, FileEntry, GitCommand, GitEvent, HeadInfo,
-    StashDiff, StashInfo,
+    MergeOutcome, StashDiff, StashInfo,
 };
 use crate::ui;
 
@@ -262,6 +262,8 @@ pub enum GitMessage {
     /// Delete the named branch. First press arms a confirmation; the second
     /// performs it.
     DeleteBranch(String),
+    /// Merge the named branch into the current branch.
+    Merge(String),
     /// Delete all local branches absent from the Remote. First press arms a
     /// confirmation; the second performs it.
     PruneBranches,
@@ -482,6 +484,7 @@ impl App {
             GitMessage::Commit => self.start_commit(false),
             GitMessage::CommitAndPush => self.start_commit(true),
             GitMessage::Checkout(name) => self.dispatch(GitCommand::Checkout(name)),
+            GitMessage::Merge(name) => self.dispatch(GitCommand::Merge(name)),
             GitMessage::CreateBranch => {
                 let name = self.branches.new_name.trim().to_string();
                 if !name.is_empty() {
@@ -718,6 +721,28 @@ impl App {
             GitEvent::StashDropped => {
                 self.stashes.drop_armed = None;
                 self.notify("Dropped stash".to_string());
+            }
+            GitEvent::Merged { branch, outcome } => {
+                match outcome {
+                    MergeOutcome::UpToDate => self.notify(format!("Already up to date with {branch}")),
+                    MergeOutcome::FastForwarded => {
+                        self.notify(format!("Fast-forwarded to {branch}"))
+                    }
+                    MergeOutcome::Created => self.notify(format!("Merged {branch}")),
+                    MergeOutcome::Conflicts(n) => {
+                        // Surface the conflicts; the user resolves them in the
+                        // Changes view and commits (which finishes the merge).
+                        let files = if n == 1 { "file" } else { "files" };
+                        self.status.message = Some(format!(
+                            "Merge of {branch} has conflicts in {n} {files} — resolve them, then commit"
+                        ));
+                        self.view = ViewMode::Changes;
+                    }
+                }
+                // A merge changes history and the working tree; keep views fresh.
+                if self.view == ViewMode::History {
+                    self.dispatch(GitCommand::LoadHistory);
+                }
             }
             GitEvent::Error(error) => {
                 self.commit.committing = false;

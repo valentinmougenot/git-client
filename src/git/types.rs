@@ -71,6 +71,8 @@ pub enum GitCommand {
     },
     /// Load the Diff of the stash at the given index (its changes vs its base).
     LoadStashDiff(usize),
+    /// Merge the named branch into the current branch.
+    Merge(String),
     /// Apply the stash at the given index without removing it.
     StashApply(usize),
     /// Apply the stash at the given index and remove it from the list.
@@ -121,8 +123,26 @@ pub enum GitEvent {
     StashApplied,
     /// A stash was dropped without being applied.
     StashDropped,
+    /// A merge finished; carries the merged branch and how it resolved.
+    Merged {
+        branch: String,
+        outcome: MergeOutcome,
+    },
     /// Any operation failed.
     Error(GitError),
+}
+
+/// How a merge resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// HEAD already contained the branch; nothing to do.
+    UpToDate,
+    /// HEAD was fast-forwarded to the branch tip (no merge commit).
+    FastForwarded,
+    /// A merge commit was created.
+    Created,
+    /// The merge left conflicts in the given number of files to resolve.
+    Conflicts(usize),
 }
 
 /// The state of HEAD and its relationship to the Remote — what the UI needs to

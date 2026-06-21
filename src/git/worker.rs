@@ -211,6 +211,16 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(diff) => events.emit(GitEvent::StashDiffLoaded(diff)),
             Err(error) => events.emit(GitEvent::Error(error)),
         },
+        GitCommand::Merge(branch) => {
+            match merge_branch(repo, &branch) {
+                Ok(outcome) => events.emit(GitEvent::Merged { branch, outcome }),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // A merge moves HEAD and the Working Tree (and may leave conflicts),
+            // so refresh the status, branch list, and any open file lists.
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
         GitCommand::StashApply(index) => {
             match stash_apply(repo, index) {
                 Ok(()) => events.emit(GitEvent::StashApplied),
@@ -548,17 +558,28 @@ fn delete_from_workdir(repo: &Repository, path: &str) -> Result<(), GitError> {
         .map_err(|error| GitError::custom("discard", error.to_string()))
 }
 
-/// Create a Commit from the current Staging Area, returning its short SHA.
+/// Create a Commit from the current Staging Area, returning its short SHA. When
+/// a merge is in progress (`MERGE_HEAD` set, e.g. after resolving conflicts),
+/// the merged commit is added as a second parent and the merge state is cleared.
 fn commit(repo: &Repository, message: &str) -> Result<String, git2::Error> {
     let mut index = repo.index()?;
     let tree_oid = index.write_tree()?;
     let tree = repo.find_tree(tree_oid)?;
     let signature = repo.signature()?;
 
-    let parents = match repo.head() {
+    let mut parents = match repo.head() {
         Ok(head) => vec![head.peel_to_commit()?],
         Err(_) => Vec::new(),
     };
+    // Finish an in-progress merge by recording its MERGE_HEAD as a parent.
+    let merge_head = repo
+        .revparse_single("MERGE_HEAD")
+        .ok()
+        .and_then(|object| object.peel_to_commit().ok());
+    let merging = merge_head.is_some();
+    if let Some(commit) = merge_head {
+        parents.push(commit);
+    }
     let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
 
     let oid = repo.commit(
@@ -569,6 +590,10 @@ fn commit(repo: &Repository, message: &str) -> Result<String, git2::Error> {
         &tree,
         &parent_refs,
     )?;
+
+    if merging {
+        repo.cleanup_state()?;
+    }
 
     Ok(short_sha(oid))
 }
@@ -1165,6 +1190,82 @@ fn create_branch(repo: &Repository, name: &str) -> Result<(), GitError> {
     repo.branch(name, &head, false)
         .map_err(|error| GitError::new("create branch", &error))?;
     checkout_branch(repo, name)
+}
+
+/// Merge the named branch into the current branch. Handles the three clean
+/// outcomes (already up to date, fast-forward, merge commit) and leaves a
+/// conflicted merge in place — with `MERGE_HEAD` set — for the user to resolve
+/// and commit (see [`commit`], which finishes an in-progress merge).
+fn merge_branch(repo: &Repository, name: &str) -> Result<MergeOutcome, GitError> {
+    let make = |context: &str, error: &git2::Error| GitError::new(context, error);
+
+    let reference = repo
+        .resolve_reference_from_short_name(name)
+        .map_err(|e| make("find branch", &e))?;
+    let annotated = repo
+        .reference_to_annotated_commit(&reference)
+        .map_err(|e| make("merge", &e))?;
+
+    let (analysis, _preference) = repo
+        .merge_analysis(&[&annotated])
+        .map_err(|e| make("merge", &e))?;
+
+    if analysis.is_up_to_date() {
+        return Ok(MergeOutcome::UpToDate);
+    }
+
+    // A fast-forward just advances HEAD to the target — no merge commit.
+    if analysis.is_fast_forward() {
+        let target = annotated.id();
+        let target_object = repo.find_object(target, None).map_err(|e| make("merge", &e))?;
+        repo.checkout_tree(&target_object, None)
+            .map_err(|e| make("merge", &e))?;
+        let mut head = repo.head().map_err(|e| make("merge", &e))?;
+        head.set_target(target, &format!("merge {name}: fast-forward"))
+            .map_err(|e| make("merge", &e))?;
+        return Ok(MergeOutcome::FastForwarded);
+    }
+
+    // A real merge: write the merged result into the index and Working Tree.
+    repo.merge(&[&annotated], None, None)
+        .map_err(|e| make("merge", &e))?;
+
+    let mut index = repo.index().map_err(|e| make("merge", &e))?;
+    if index.has_conflicts() {
+        let conflicts = index
+            .conflicts()
+            .map(|iter| iter.count())
+            .unwrap_or(0)
+            .max(1);
+        // Leave the conflicted state for the user to resolve and commit.
+        return Ok(MergeOutcome::Conflicts(conflicts));
+    }
+
+    // No conflicts: record the merge commit (HEAD + the merged branch) and clear
+    // the in-progress merge state.
+    let tree = repo
+        .find_tree(index.write_tree().map_err(|e| make("merge", &e))?)
+        .map_err(|e| make("merge", &e))?;
+    let signature = repo.signature().map_err(|e| make("merge", &e))?;
+    let head_commit = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| make("merge", &e))?;
+    let their_commit = repo
+        .find_commit(annotated.id())
+        .map_err(|e| make("merge", &e))?;
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        &format!("Merge branch '{name}'"),
+        &tree,
+        &[&head_commit, &their_commit],
+    )
+    .map_err(|e| make("merge", &e))?;
+    repo.cleanup_state().map_err(|e| make("merge", &e))?;
+
+    Ok(MergeOutcome::Created)
 }
 
 /// Delete a local branch. Refuses to delete the branch currently checked out.
@@ -2187,6 +2288,95 @@ mod tests {
                 .iter()
                 .any(|l| l.kind == DiffLineKind::Header && l.content.contains("a.txt"))
         );
+    }
+
+    /// The outcome of the most recent `Merged` event.
+    fn last_merge(events: &Collector) -> MergeOutcome {
+        events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::Merged { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .expect("expected a Merged event")
+    }
+
+    #[test]
+    fn merge_of_an_already_contained_branch_is_up_to_date() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+
+        // feature points at the same commit as master.
+        process(&repo, GitCommand::Merge("feature".into()), &events);
+        assert_eq!(last_merge(&events), MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn merge_fast_forwards_when_head_has_not_diverged() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "b.txt", "two\n");
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+
+        // master is strictly behind feature, so the merge fast-forwards.
+        process(&repo, GitCommand::Merge("feature".into()), &events);
+        assert_eq!(last_merge(&events), MergeOutcome::FastForwarded);
+        // The fast-forwarded file is now present, with no merge commit.
+        assert!(dir.path().join("b.txt").exists());
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_count(), 1);
+    }
+
+    #[test]
+    fn merge_creates_a_commit_when_both_branches_advanced() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "base.txt", "base\n");
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "feature.txt", "f\n");
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+        commit_file(dir.path(), &repo, &events, "master.txt", "m\n");
+
+        // Non-conflicting divergent changes produce a merge commit.
+        process(&repo, GitCommand::Merge("feature".into()), &events);
+        assert_eq!(last_merge(&events), MergeOutcome::Created);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_count(), 2);
+        assert!(dir.path().join("feature.txt").exists());
+        assert!(dir.path().join("master.txt").exists());
+    }
+
+    #[test]
+    fn conflicting_merge_is_reported_and_finished_by_a_commit() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "base\n");
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "a.txt", "feature\n");
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+        commit_file(dir.path(), &repo, &events, "a.txt", "master\n");
+
+        // Both sides changed the same file: the merge conflicts.
+        process(&repo, GitCommand::Merge("feature".into()), &events);
+        assert_eq!(last_merge(&events), MergeOutcome::Conflicts(1));
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+
+        // Resolve the conflict, stage it, and commit: the merge is finished as a
+        // two-parent commit and the merge state is cleared.
+        write(dir.path(), "a.txt", "resolved\n");
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Commit("merge".into()), &events);
+
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_count(), 2);
     }
 }
 

@@ -373,6 +373,24 @@ pub fn ghost_danger(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// A quiet, borderless neutral button for in-row actions (e.g. Merge), the
+/// calm counterpart to [`ghost_danger`].
+pub fn ghost(_theme: &Theme, status: button::Status) -> button::Style {
+    let (background, text_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            (Some(Background::Color(with_alpha(ACCENT, 0.18))), ACCENT)
+        }
+        _ => (None, with_alpha(ACCENT, 0.65)),
+    };
+
+    button::Style {
+        background,
+        text_color,
+        border: radius(6.0),
+        ..button::Style::default()
+    }
+}
+
 /// The filled accent Commit button.
 pub fn primary(_theme: &Theme, status: button::Status) -> button::Style {
     let background = match status {
