@@ -5,7 +5,7 @@
 
 use iced::theme::Palette;
 use iced::widget::{button, checkbox, container, text_input};
-use iced::{Background, Border, Color, Theme};
+use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 // ── Palette ──────────────────────────────────────────────────────────────
 // The "Tokyo Night" scale: a deep, near-black base with a faint blue cast, a
@@ -131,6 +131,26 @@ pub fn panel(_: &Theme) -> container::Style {
             color: BORDER,
             width: 1.0,
             radius: 12.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A floating context menu: an elevated surface lifted off the page with a soft
+/// drop shadow so it reads as hovering above the content it covers.
+pub fn menu(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_ELEVATED)),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        shadow: Shadow {
+            color: Color { a: 0.45, ..Color::BLACK },
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
         },
         ..container::Style::default()
     }

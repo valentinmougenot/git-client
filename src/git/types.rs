@@ -42,6 +42,13 @@ pub enum GitCommand {
     LoadHistory,
     /// Load one Commit's metadata and full Diff (against its first parent).
     LoadCommitDetail(String),
+    /// Move the current branch to the given Commit, with the chosen reset mode
+    /// (soft keeps the index and Working Tree; mixed resets the index; hard
+    /// resets both, discarding uncommitted changes).
+    Reset { sha: String, kind: ResetKind },
+    /// Revert the given Commit: apply its inverse on top of HEAD. A clean revert
+    /// is committed immediately; a conflicting one is left to resolve and commit.
+    Revert(String),
     /// Load the local branches and their sync state.
     LoadBranches,
     /// Load the tags, pointing at their target Commits.
@@ -117,6 +124,10 @@ pub enum GitEvent {
     HistoryLoaded(Vec<CommitInfo>),
     /// One Commit's metadata and full Diff.
     CommitDetailLoaded(CommitDetail),
+    /// A reset completed; carries the short SHA the branch now points at.
+    ResetDone(String),
+    /// A revert finished; carries how it resolved.
+    Reverted { outcome: RevertOutcome },
     /// The local branches and their sync state.
     BranchesLoaded(Vec<BranchInfo>),
     /// The tags and their target Commits.
@@ -166,6 +177,26 @@ pub enum MergeOutcome {
     /// A merge commit was created.
     Created,
     /// The merge left conflicts in the given number of files to resolve.
+    Conflicts(usize),
+}
+
+/// Which reset mode to apply when moving the branch to another Commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetKind {
+    /// Move HEAD only; keep the index and Working Tree (changes become staged).
+    Soft,
+    /// Move HEAD and reset the index; keep the Working Tree (changes unstaged).
+    Mixed,
+    /// Move HEAD and reset both the index and Working Tree, discarding changes.
+    Hard,
+}
+
+/// How a revert resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevertOutcome {
+    /// The revert applied cleanly and was committed.
+    Created,
+    /// The revert left conflicts in the given number of files to resolve.
     Conflicts(usize),
 }
 

@@ -12,15 +12,17 @@ mod worddiff;
 
 use iced::widget::canvas;
 use iced::widget::{
-    button, checkbox, column, container, rich_text, row, scrollable, space, span, stack, text,
-    text_input,
+    button, checkbox, column, container, mouse_area, rich_text, row, scrollable, space, span,
+    stack, text, text_input,
 };
 use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Right, Theme};
 
-use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
+use crate::app::{
+    App, CommitMenu, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode,
+};
 use crate::git::{
     BranchInfo, ChangeKind, CommitInfo, ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry,
-    HeadInfo, StashInfo, TagInfo,
+    HeadInfo, ResetKind, StashInfo, TagInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -80,11 +82,103 @@ pub fn root(app: &App) -> Element<'_, Message> {
 
     let body = row![left, right].spacing(12).height(Fill);
 
-    container(column![top_bar(app), body, status_bar(app)].spacing(12))
+    let base = container(column![top_bar(app), body, status_bar(app)].spacing(12))
         .style(style::app)
         .padding(12)
         .width(Fill)
-        .height(Fill)
+        .height(Fill);
+
+    // When a commit context menu is open, float it over everything at the
+    // pointer, with a full-window catcher beneath it that closes on any click.
+    match &app.commit_menu {
+        Some(menu) => {
+            let dismiss = mouse_area(container(space::vertical()).width(Fill).height(Fill))
+                .on_press(Message::Ui(UiMessage::CloseCommitMenu))
+                .on_right_press(Message::Ui(UiMessage::CloseCommitMenu));
+            stack![base, dismiss, commit_menu_overlay(menu)].into()
+        }
+        None => base.into(),
+    }
+}
+
+/// Position the commit context menu at its anchor point using spacers, leaving
+/// the rest of the layer transparent (clicks there fall through to the catcher).
+fn commit_menu_overlay(menu: &CommitMenu) -> Element<'_, Message> {
+    let positioned = row![
+        container(text("")).width(Length::Fixed(menu.at.x)),
+        commit_menu_panel(menu),
+    ];
+    column![
+        container(text("")).height(Length::Fixed(menu.at.y)),
+        positioned,
+    ]
+    .into()
+}
+
+/// The commit context menu itself: a header with the short SHA, then the
+/// Revert and Reset (soft / mixed / hard) actions. Hard reset arms on first
+/// press and confirms on the second.
+fn commit_menu_panel(menu: &CommitMenu) -> Element<'_, Message> {
+    let sha = menu.sha.clone();
+    let item = |label: &str, message: GitMessage, danger: bool| {
+        let style = if danger {
+            style::ghost_danger as fn(&iced::Theme, button::Status) -> button::Style
+        } else {
+            style::ghost
+        };
+        button(text(label.to_string()).size(13))
+            .on_press(Message::Git(message))
+            .width(Fill)
+            .padding([6, 10])
+            .style(style)
+    };
+
+    let hard_label = if menu.hard_armed {
+        "Confirm hard reset?"
+    } else {
+        "Reset (hard)"
+    };
+
+    let menu_column = column![
+        container(
+            text(format!("Commit {}", menu.short_sha))
+                .size(11)
+                .font(Font::MONOSPACE)
+                .color(style::TEXT_FAINT)
+        )
+        .padding([4, 10]),
+        item("Revert", GitMessage::Revert(sha.clone()), false),
+        item(
+            "Reset (soft)",
+            GitMessage::Reset {
+                sha: sha.clone(),
+                kind: ResetKind::Soft,
+            },
+            false,
+        ),
+        item(
+            "Reset (mixed)",
+            GitMessage::Reset {
+                sha: sha.clone(),
+                kind: ResetKind::Mixed,
+            },
+            false,
+        ),
+        item(
+            hard_label,
+            GitMessage::Reset {
+                sha,
+                kind: ResetKind::Hard,
+            },
+            true,
+        ),
+    ]
+    .spacing(2);
+
+    container(menu_column)
+        .style(style::menu)
+        .padding(6)
+        .width(Length::Fixed(190.0))
         .into()
 }
 
@@ -736,8 +830,11 @@ fn commit_row<'a>(
         .padding([7, 8])
         .style(style::file_item(active));
 
-    container(row![cell, body].spacing(6).align_y(Center))
-        .height(Length::Fixed(COMMIT_ROW_H))
+    // Right-click anywhere on the row opens its context menu (Reset / Revert).
+    let row = container(row![cell, body].spacing(6).align_y(Center))
+        .height(Length::Fixed(COMMIT_ROW_H));
+    mouse_area(row)
+        .on_right_press(Message::Ui(UiMessage::OpenCommitMenu(commit.sha.clone())))
         .into()
 }
 

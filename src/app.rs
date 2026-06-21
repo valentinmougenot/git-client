@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::key::Named;
 use iced::keyboard::{Event as KeyEvent, Key};
-use iced::{Subscription, Task};
+use iced::{Point, Subscription, Task};
 
 use crate::git::{
     self, BranchInfo, CommitDetail, CommitInfo, ConflictSide, Diff, FileEntry, GitCommand, GitEvent,
-    HeadInfo, MergeOutcome, StashDiff, StashInfo, TagInfo,
+    HeadInfo, MergeOutcome, ResetKind, RevertOutcome, StashDiff, StashInfo, TagInfo,
 };
 use crate::ui;
 
@@ -72,6 +72,22 @@ pub struct App {
     pub collapsed: HashSet<String>,
     /// Whether Discard is armed, awaiting a confirming second press.
     pub discard_armed: bool,
+    /// The last known cursor position (window coordinates), tracked while the
+    /// History view is open so a right-click menu can open at the pointer.
+    pub cursor: Point,
+    /// The open commit context menu (right-click on a History commit), if any.
+    pub commit_menu: Option<CommitMenu>,
+}
+
+/// An open right-click context menu over a History commit: which commit, where
+/// to draw it, and whether its destructive Hard reset is armed.
+pub struct CommitMenu {
+    pub sha: String,
+    pub short_sha: String,
+    pub at: Point,
+    /// Whether "Reset (hard)" has been armed by a first press (it needs a
+    /// confirming second press, like the other destructive actions).
+    pub hard_armed: bool,
 }
 
 /// The Commit history view's state: the loaded log, the selected Commit, and
@@ -193,6 +209,9 @@ pub enum Message {
     Git(GitMessage),
     /// A result arriving from the Git Worker.
     GitEvent(GitEvent),
+    /// The cursor moved; updates the tracked pointer position. Handled outside
+    /// [`UiMessage`] so it never cancels pending confirmations.
+    CursorMoved(Point),
     /// Periodic tick used to expire Notifications.
     Tick,
     /// A key press with no binding; ignored.
@@ -241,6 +260,10 @@ pub enum UiMessage {
     ShowView(ViewMode),
     /// Select a Commit in the History view and load its detail.
     CommitSelected(String),
+    /// Open the right-click context menu for a History commit (at the cursor).
+    OpenCommitMenu(String),
+    /// Close the open commit context menu.
+    CloseCommitMenu,
     /// The new-branch name field changed.
     NewBranchNameChanged(String),
     /// The new-tag name field changed.
@@ -300,6 +323,11 @@ pub enum GitMessage {
     DeleteTag(String),
     /// Push the named tag to the Remote.
     PushTag(String),
+    /// Move the current branch to a Commit with the given reset mode. A Hard
+    /// reset first arms a confirmation in the menu; the second press performs it.
+    Reset { sha: String, kind: ResetKind },
+    /// Revert a Commit (apply its inverse on top of HEAD).
+    Revert(String),
     Push,
     Pull,
     /// Update remote-tracking branches from the Remote without merging.
@@ -334,6 +362,8 @@ impl App {
             checked: HashSet::new(),
             collapsed: HashSet::new(),
             discard_armed: false,
+            cursor: Point::ORIGIN,
+            commit_menu: None,
         }
     }
 
@@ -394,6 +424,8 @@ impl App {
             UiMessage::SelectPrevious => self.move_selection(-1),
             UiMessage::ShowView(view) => self.show_view(view),
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
+            UiMessage::OpenCommitMenu(sha) => self.open_commit_menu(sha),
+            UiMessage::CloseCommitMenu => self.commit_menu = None,
             UiMessage::NewBranchNameChanged(name) => self.branches.new_name = name,
             UiMessage::NewTagNameChanged(name) => self.tags.new_name = name,
             UiMessage::TagMessageChanged(message) => self.tags.message = message,
@@ -419,6 +451,25 @@ impl App {
             ViewMode::Tags => self.dispatch(GitCommand::LoadTags),
             ViewMode::Changes => {}
         }
+    }
+
+    /// Open the right-click context menu for a History commit at the cursor,
+    /// selecting it too so its detail shows alongside the menu.
+    fn open_commit_menu(&mut self, sha: String) {
+        let short_sha = self
+            .history
+            .commits
+            .iter()
+            .find(|c| c.sha == sha)
+            .map(|c| c.short_sha.clone())
+            .unwrap_or_else(|| sha.chars().take(7).collect());
+        self.commit_menu = Some(CommitMenu {
+            sha: sha.clone(),
+            short_sha,
+            at: self.cursor,
+            hard_armed: false,
+        });
+        self.select_commit(sha);
     }
 
     /// Select a Commit and request its detail.
@@ -575,6 +626,24 @@ impl App {
             GitMessage::PushTag(name) => {
                 self.start_remote("Pushing tag…", GitCommand::PushTag(name))
             }
+            GitMessage::Reset { sha, kind } => {
+                // A Hard reset discards uncommitted work, so it takes a
+                // confirming second press in the menu before it fires.
+                if kind == ResetKind::Hard
+                    && self.commit_menu.as_ref().is_some_and(|m| !m.hard_armed)
+                {
+                    if let Some(menu) = &mut self.commit_menu {
+                        menu.hard_armed = true;
+                    }
+                    return;
+                }
+                self.commit_menu = None;
+                self.dispatch(GitCommand::Reset { sha, kind });
+            }
+            GitMessage::Revert(sha) => {
+                self.commit_menu = None;
+                self.dispatch(GitCommand::Revert(sha));
+            }
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
             GitMessage::Fetch => self.start_remote("Fetching…", GitCommand::Fetch),
@@ -719,6 +788,26 @@ impl App {
                     self.history.detail = Some(detail);
                 }
             }
+            GitEvent::ResetDone(sha) => {
+                self.notify(format!("Reset to {sha}"));
+                // HEAD moved, so the history and any open diff are stale.
+                self.dispatch(GitCommand::LoadHistory);
+            }
+            GitEvent::Reverted { outcome } => match outcome {
+                RevertOutcome::Created => {
+                    self.notify("Reverted commit".to_string());
+                    self.dispatch(GitCommand::LoadHistory);
+                }
+                RevertOutcome::Conflicts(n) => {
+                    // Surface the conflicts; the user resolves them in the
+                    // Changes view and commits (which finishes the revert).
+                    let files = if n == 1 { "file" } else { "files" };
+                    self.status.message = Some(format!(
+                        "Revert has conflicts in {n} {files} — resolve them, then commit"
+                    ));
+                    self.view = ViewMode::Changes;
+                }
+            },
             GitEvent::Committed(sha) => {
                 self.commit.committing = false;
                 self.commit.message.clear();
@@ -1004,6 +1093,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Ui(message) => app.update_ui(message),
         Message::Git(message) => app.update_git(message),
         Message::GitEvent(event) => app.update_event(event),
+        Message::CursorMoved(point) => app.cursor = point,
         Message::Tick => app.expire_notification(),
         Message::Ignored => {}
     }
@@ -1017,12 +1107,26 @@ fn view(app: &App) -> iced::Element<'_, Message> {
 
 /// All the streams the app listens to: the Git Worker, the keyboard, and a
 /// timer that expires Notifications.
-fn subscription(_app: &App) -> Subscription<Message> {
-    Subscription::batch([
+fn subscription(app: &App) -> Subscription<Message> {
+    let mut subs = vec![
         Subscription::run(git_worker),
         iced::keyboard::listen().map(on_key),
         iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
-    ])
+    ];
+    // Track the pointer only while the History view is open — the one place a
+    // right-click menu opens at the cursor — so we don't re-render on every
+    // mouse move elsewhere.
+    if app.view == ViewMode::History {
+        subs.push(iced::event::listen_with(|event, _status, _window| {
+            match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::CursorMoved(position))
+                }
+                _ => None,
+            }
+        }));
+    }
+    Subscription::batch(subs)
 }
 
 /// Spawn the Git Worker thread and bridge its events into the iced runtime.

@@ -134,6 +134,23 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(detail) => events.emit(GitEvent::CommitDetailLoaded(detail)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
         },
+        GitCommand::Reset { sha, kind } => {
+            match reset_to(repo, &sha, kind) {
+                Ok(short) => events.emit(GitEvent::ResetDone(short)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            // A reset moves HEAD and may change the index/Working Tree, so
+            // refresh the status and branch list.
+            emit_status(repo, events);
+            emit_branches(repo, events);
+        }
+        GitCommand::Revert(sha) => {
+            match revert(repo, &sha) {
+                Ok(outcome) => events.emit(GitEvent::Reverted { outcome }),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_status(repo, events);
+        }
         GitCommand::LoadBranches => emit_branches(repo, events),
         GitCommand::LoadTags => emit_tags(repo, events),
         GitCommand::CreateTag { name, message } => {
@@ -619,12 +636,13 @@ fn commit(repo: &Repository, message: &str) -> Result<String, git2::Error> {
         Ok(head) => vec![head.peel_to_commit()?],
         Err(_) => Vec::new(),
     };
-    // Finish an in-progress merge by recording its MERGE_HEAD as a parent.
+    // Finish an in-progress merge by recording its MERGE_HEAD as a parent. A
+    // revert in progress has no extra parent (it is a single-parent commit on
+    // HEAD), but does leave state to clear below.
     let merge_head = repo
         .revparse_single("MERGE_HEAD")
         .ok()
         .and_then(|object| object.peel_to_commit().ok());
-    let merging = merge_head.is_some();
     if let Some(commit) = merge_head {
         parents.push(commit);
     }
@@ -639,7 +657,8 @@ fn commit(repo: &Repository, message: &str) -> Result<String, git2::Error> {
         &parent_refs,
     )?;
 
-    if merging {
+    // Clear any in-progress merge/revert/cherry-pick state this commit finished.
+    if repo.state() != git2::RepositoryState::Clean {
         repo.cleanup_state()?;
     }
 
@@ -826,6 +845,62 @@ fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2
         message: commit.message().unwrap_or_default().to_string(),
         lines,
     })
+}
+
+/// Move the current branch to the Commit `sha` with the given reset mode,
+/// returning the short SHA it now points at.
+fn reset_to(repo: &Repository, sha: &str, kind: ResetKind) -> Result<String, GitError> {
+    let oid = git2::Oid::from_str(sha).map_err(|error| GitError::new("reset", &error))?;
+    let object = repo
+        .find_object(oid, None)
+        .map_err(|error| GitError::new("reset", &error))?;
+    let reset_type = match kind {
+        ResetKind::Soft => git2::ResetType::Soft,
+        ResetKind::Mixed => git2::ResetType::Mixed,
+        ResetKind::Hard => git2::ResetType::Hard,
+    };
+    repo.reset(&object, reset_type, None)
+        .map_err(|error| GitError::new("reset", &error))?;
+    Ok(short_sha(oid))
+}
+
+/// Revert the Commit `sha`: apply its inverse on top of HEAD. A clean revert is
+/// committed straight away (`git revert --no-edit`); a conflicting one is left
+/// in place — with REVERT_HEAD set — for the user to resolve and commit (see
+/// [`commit`], which clears the revert state).
+fn revert(repo: &Repository, sha: &str) -> Result<RevertOutcome, GitError> {
+    let make = |context: &str, error: &git2::Error| GitError::new(context, error);
+    let oid = git2::Oid::from_str(sha).map_err(|e| make("revert", &e))?;
+    let commit = repo.find_commit(oid).map_err(|e| make("revert", &e))?;
+
+    repo.revert(&commit, None).map_err(|e| make("revert", &e))?;
+
+    let mut index = repo.index().map_err(|e| make("revert", &e))?;
+    if index.has_conflicts() {
+        let conflicts = index
+            .conflicts()
+            .map(|iter| iter.count())
+            .unwrap_or(0)
+            .max(1);
+        return Ok(RevertOutcome::Conflicts(conflicts));
+    }
+
+    // Clean revert: record it as a single-parent commit on HEAD and clear state.
+    let tree = repo
+        .find_tree(index.write_tree().map_err(|e| make("revert", &e))?)
+        .map_err(|e| make("revert", &e))?;
+    let signature = repo.signature().map_err(|e| make("revert", &e))?;
+    let head = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| make("revert", &e))?;
+    let summary = commit.summary().ok().flatten().unwrap_or_default();
+    let message = format!("Revert \"{summary}\"\n\nThis reverts commit {oid}.");
+    repo.commit(Some("HEAD"), &signature, &signature, &message, &tree, &[&head])
+        .map_err(|e| make("revert", &e))?;
+    repo.cleanup_state().map_err(|e| make("revert", &e))?;
+
+    Ok(RevertOutcome::Created)
 }
 
 /// Push the current branch to `origin` over SSH. When the branch has no
@@ -2628,6 +2703,109 @@ mod tests {
         // The tag now exists on the remote.
         let remote_repo = Repository::open(remote.path()).unwrap();
         assert!(remote_repo.revparse_single("refs/tags/v1.0").is_ok());
+    }
+
+    #[test]
+    fn reset_hard_moves_head_and_discards_working_changes() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        let first = repo.head().unwrap().target().unwrap().to_string();
+        commit_file(dir.path(), &repo, &events, "a.txt", "two\n");
+
+        // An uncommitted edit on top of the second commit.
+        write(dir.path(), "a.txt", "scratch\n");
+        process(
+            &repo,
+            GitCommand::Reset {
+                sha: first.clone(),
+                kind: ResetKind::Hard,
+            },
+            &events,
+        );
+
+        // HEAD is back at the first commit and the file matches it; the scratch
+        // edit and the second commit's content are both gone.
+        assert_eq!(repo.head().unwrap().target().unwrap().to_string(), first);
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
+        let (unstaged, staged) = events.last_status();
+        assert!(unstaged.is_empty() && staged.is_empty());
+    }
+
+    #[test]
+    fn reset_soft_moves_head_but_keeps_the_changes_staged() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        let first = repo.head().unwrap().target().unwrap().to_string();
+        commit_file(dir.path(), &repo, &events, "b.txt", "two\n");
+
+        process(
+            &repo,
+            GitCommand::Reset {
+                sha: first.clone(),
+                kind: ResetKind::Soft,
+            },
+            &events,
+        );
+
+        // HEAD moved back, but the second commit's file is now staged, not lost.
+        assert_eq!(repo.head().unwrap().target().unwrap().to_string(), first);
+        let (_unstaged, staged) = events.last_status();
+        assert_eq!(paths(&staged), ["b.txt"]);
+    }
+
+    #[test]
+    fn revert_creates_an_inverse_commit() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        // A second commit that adds a file, which the revert should remove.
+        commit_file(dir.path(), &repo, &events, "b.txt", "two\n");
+        let to_revert = repo.head().unwrap().target().unwrap().to_string();
+
+        process(&repo, GitCommand::Revert(to_revert), &events);
+
+        assert!(matches!(
+            events.events().iter().rev().find_map(|e| match e {
+                GitEvent::Reverted { outcome } => Some(outcome.clone()),
+                _ => None,
+            }),
+            Some(RevertOutcome::Created)
+        ));
+        // The reverting commit is on top, and b.txt is gone again.
+        assert!(!dir.path().join("b.txt").exists());
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert!(head.summary().unwrap().unwrap().starts_with("Revert"));
+        assert_eq!(head.parent_count(), 1);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+    }
+
+    #[test]
+    fn conflicting_revert_is_reported_and_finished_by_a_commit() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "one\n");
+        let base = repo.head().unwrap().target().unwrap().to_string();
+        // Two further edits to the same line: reverting the base no longer
+        // applies cleanly against the current content.
+        commit_file(dir.path(), &repo, &events, "a.txt", "two\n");
+        commit_file(dir.path(), &repo, &events, "a.txt", "three\n");
+
+        process(&repo, GitCommand::Revert(base), &events);
+
+        let outcome = events.events().into_iter().rev().find_map(|e| match e {
+            GitEvent::Reverted { outcome } => Some(outcome),
+            _ => None,
+        });
+        assert!(matches!(outcome, Some(RevertOutcome::Conflicts(_))));
+        assert_ne!(repo.state(), git2::RepositoryState::Clean);
+
+        // Resolving and committing finishes the revert and clears the state.
+        write(dir.path(), "a.txt", "resolved\n");
+        process(&repo, GitCommand::StageFile("a.txt".into()), &events);
+        process(&repo, GitCommand::Commit("finish revert".into()), &events);
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
     }
 
     /// The outcome of the most recent `Merged` event.
