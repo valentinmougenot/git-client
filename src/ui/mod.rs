@@ -20,7 +20,7 @@ use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Righ
 use crate::app::{App, GitMessage, HistoryState, Message, RepoState, Selection, UiMessage, ViewMode};
 use crate::git::{
     BranchInfo, ChangeKind, CommitInfo, ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry,
-    HeadInfo, StashInfo,
+    HeadInfo, StashInfo, TagInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -36,6 +36,7 @@ pub fn root(app: &App) -> Element<'_, Message> {
         ViewMode::History => history_list(&app.history),
         ViewMode::Branches => branches_list(app),
         ViewMode::Stashes => stashes_list(app),
+        ViewMode::Tags => tags_list(app),
     };
     let left = container(column![view_tabs(app), left_body])
         .style(style::panel)
@@ -70,6 +71,11 @@ pub fn root(app: &App) -> Element<'_, Message> {
             .width(Length::FillPortion(3))
             .height(Fill)
             .into(),
+        ViewMode::Tags => container(tags_detail(app))
+            .style(style::panel)
+            .width(Length::FillPortion(3))
+            .height(Fill)
+            .into(),
     };
 
     let body = row![left, right].spacing(12).height(Fill);
@@ -99,20 +105,36 @@ fn view_tabs(app: &App) -> Element<'_, Message> {
         "Stashes".to_string()
     };
 
-    let tabs = row![
+    let tags_count = app.tags.tags.len();
+    let tags_label = if tags_count > 0 {
+        format!("Tags ({tags_count})")
+    } else {
+        "Tags".to_string()
+    };
+
+    // Five tabs do not fit one row in the narrow left column, so they wrap onto
+    // two rows. Each tab fills its row equally, keeping a tidy grid.
+    let row1 = row![
         tab(&changes_label, ViewMode::Changes, app.view),
         tab("History", ViewMode::History, app.view),
         tab("Branches", ViewMode::Branches, app.view),
+    ]
+    .spacing(4);
+    let row2 = row![
         tab(&stashes_label, ViewMode::Stashes, app.view),
+        tab(&tags_label, ViewMode::Tags, app.view),
     ]
     .spacing(4);
 
-    container(tabs).padding([8, 10]).into()
+    container(column![row1, row2].spacing(4))
+        .padding([8, 10])
+        .into()
 }
 
 fn tab<'a>(label: &str, target: ViewMode, current: ViewMode) -> Element<'a, Message> {
-    button(text(label.to_string()).size(13))
+    button(text(label.to_string()).size(13).center())
         .on_press(Message::Ui(UiMessage::ShowView(target)))
+        .width(Fill)
         .padding([6, 12])
         .style(style::tab(target == current))
         .into()
@@ -1203,6 +1225,120 @@ fn stashes_detail(app: &App) -> Element<'_, Message> {
             .size(12)
             .color(style::TEXT_FAINT),
         text("Pop applies & removes · Apply keeps it · Drop deletes it")
+            .size(12)
+            .color(style::TEXT_FAINT),
+    ]
+    .spacing(8);
+
+    container(lines.align_x(Center))
+        .center(Fill)
+        .padding(12)
+        .into()
+}
+
+// ── Tags ──────────────────────────────────────────────────────────────────
+
+/// The left column in the Tags view: a tag creator (name + optional annotation
+/// message) at the top, then the tags, each pointing at its target Commit.
+fn tags_list(app: &App) -> Element<'_, Message> {
+    let mut items: Vec<Element<Message>> = Vec::new();
+
+    let can_create = !app.tags.new_name.trim().is_empty();
+    let name = text_input("New tag name", &app.tags.new_name)
+        .on_input(|value| Message::Ui(UiMessage::NewTagNameChanged(value)))
+        .on_submit(Message::Git(GitMessage::CreateTag))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let create = pill("+", 15, "Create", GitMessage::CreateTag, Tone::Normal, can_create);
+    items.push(row![name, create].spacing(6).align_y(Center).into());
+
+    // An optional annotation message; supplying one makes the tag annotated.
+    let message = text_input("Annotation message (optional)", &app.tags.message)
+        .on_input(|value| Message::Ui(UiMessage::TagMessageChanged(value)))
+        .on_submit(Message::Git(GitMessage::CreateTag))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    items.push(message.into());
+
+    items.push(gap(8.0));
+    items.push(branch_section_label("TAGS", app.tags.tags.len()));
+    if app.tags.tags.is_empty() {
+        items.push(placeholder("No tags yet"));
+    } else {
+        let armed = app.tags.delete_armed.as_deref();
+        let has_remote = app.repo.head.has_remote;
+        for tag in &app.tags.tags {
+            items.push(tag_row(tag, armed == Some(tag.name.as_str()), has_remote));
+        }
+    }
+
+    scrollable(column(items).spacing(4).padding(12))
+        .height(Fill)
+        .into()
+}
+
+/// One tag: its name and a tag/annotation marker, the target Commit it points
+/// at, and — stacked at the right — Push (when a Remote exists) and Delete
+/// actions. Delete first arms a confirmation, then performs it.
+fn tag_row<'a>(tag: &TagInfo, armed: bool, has_remote: bool) -> Element<'a, Message> {
+    let marker_color = if tag.is_annotated {
+        style::ACCENT
+    } else {
+        style::TEXT_FAINT
+    };
+
+    let label = column![
+        row![
+            text("🏷").size(12).color(marker_color),
+            text(tag.name.clone()).size(14).color(style::TEXT),
+        ]
+        .spacing(8)
+        .align_y(Center),
+        text(format!("{}  {}", tag.target, tag.summary))
+            .size(11)
+            .color(style::TEXT_FAINT),
+    ]
+    .spacing(2)
+    .width(Fill);
+
+    let label = container(label).padding([4, 8]).width(Fill);
+
+    let mut actions = row![].spacing(2).align_y(Center);
+    if has_remote {
+        let push = button(text("Push").size(11))
+            .on_press(Message::Git(GitMessage::PushTag(tag.name.clone())))
+            .padding([4, 8])
+            .style(style::ghost);
+        actions = actions.push(push);
+    }
+    let delete = button(text(if armed { "Confirm?" } else { "✕" }).size(if armed { 11 } else { 13 }))
+        .on_press(Message::Git(GitMessage::DeleteTag(tag.name.clone())))
+        .padding([4, 8])
+        .style(style::ghost_danger);
+    actions = actions.push(delete);
+
+    container(row![label, actions].spacing(5).align_y(Center))
+        .padding([4, 6])
+        .width(Fill)
+        .into()
+}
+
+/// The right panel in the Tags view: a short summary and a usage hint.
+fn tags_detail(app: &App) -> Element<'_, Message> {
+    let title = match app.tags.tags.len() {
+        0 => "No tags".to_string(),
+        1 => "1 tag".to_string(),
+        n => format!("{n} tags"),
+    };
+
+    let lines = column![
+        text(title).size(16).color(style::TEXT),
+        text("Create a tag at the current commit (HEAD)")
+            .size(12)
+            .color(style::TEXT_FAINT),
+        text("A message makes it annotated · Push to publish · ✕ to delete")
             .size(12)
             .color(style::TEXT_FAINT),
     ]

@@ -135,6 +135,27 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
         },
         GitCommand::LoadBranches => emit_branches(repo, events),
+        GitCommand::LoadTags => emit_tags(repo, events),
+        GitCommand::CreateTag { name, message } => {
+            match create_tag(repo, &name, message.as_deref()) {
+                Ok(()) => events.emit(GitEvent::TagCreated(name)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_tags(repo, events);
+        }
+        GitCommand::DeleteTag(name) => {
+            match delete_tag(repo, &name) {
+                Ok(()) => events.emit(GitEvent::TagDeleted(name)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+            emit_tags(repo, events);
+        }
+        GitCommand::PushTag(name) => {
+            match push_tag(repo, &name) {
+                Ok(()) => events.emit(GitEvent::Pushed),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+        }
         GitCommand::Checkout(name) => {
             match checkout_branch(repo, &name) {
                 Ok(()) => events.emit(GitEvent::CheckedOut(name)),
@@ -934,6 +955,92 @@ fn emit_branches(repo: &Repository, events: &impl EventSink) {
     }
 }
 
+/// Read the tags and emit them, or surface the failure.
+fn emit_tags(repo: &Repository, events: &impl EventSink) {
+    match load_tags(repo) {
+        Ok(tags) => events.emit(GitEvent::TagsLoaded(tags)),
+        Err(error) => events.emit(GitEvent::Error(GitError::new("load tags", &error))),
+    }
+}
+
+/// List the tags, each resolved to the Commit it ultimately points at. An
+/// annotated tag (a tag object) carries its message and tagger; a lightweight
+/// tag is just a ref to a Commit. Sorted by name.
+fn load_tags(repo: &Repository) -> Result<Vec<TagInfo>, git2::Error> {
+    let mut tags = Vec::new();
+    for name in repo.tag_names(None)?.iter().flatten().flatten() {
+        let object = repo.revparse_single(&format!("refs/tags/{name}"))?;
+        let (message, is_annotated, commit) = match object.kind() {
+            Some(ObjectType::Tag) => {
+                let tag = object.into_tag().expect("kind() reported a tag");
+                let message = tag
+                    .message()
+                    .ok()
+                    .flatten()
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
+                (message, true, tag.target()?.peel_to_commit()?)
+            }
+            _ => (None, false, object.peel_to_commit()?),
+        };
+        tags.push(TagInfo {
+            name: name.to_string(),
+            target: short_sha(commit.id()),
+            summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
+            message,
+            is_annotated,
+        });
+    }
+    Ok(tags)
+}
+
+/// Create a tag at HEAD. A non-empty `message` makes it annotated (a tag object
+/// with the committer as tagger); otherwise it is a lightweight ref.
+fn create_tag(repo: &Repository, name: &str, message: Option<&str>) -> Result<(), GitError> {
+    let target = repo
+        .head()
+        .and_then(|head| head.peel(ObjectType::Commit))
+        .map_err(|error| GitError::new("resolve HEAD", &error))?;
+
+    match message {
+        Some(message) if !message.trim().is_empty() => {
+            let signature = repo
+                .signature()
+                .map_err(|error| GitError::new("create tag", &error))?;
+            repo.tag(name, &target, &signature, message.trim(), false)
+                .map_err(|error| GitError::new("create tag", &error))?;
+        }
+        _ => {
+            repo.tag_lightweight(name, &target, false)
+                .map_err(|error| GitError::new("create tag", &error))?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete the named tag.
+fn delete_tag(repo: &Repository, name: &str) -> Result<(), GitError> {
+    repo.tag_delete(name)
+        .map_err(|error| GitError::new("delete tag", &error))
+}
+
+/// Push the named tag to `origin` over SSH.
+fn push_tag(repo: &Repository, name: &str) -> Result<(), GitError> {
+    let mut remote = repo
+        .find_remote("origin")
+        .map_err(|error| GitError::new("find remote 'origin'", &error))?;
+
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(ssh_credentials_callback());
+    let mut options = PushOptions::new();
+    options.remote_callbacks(callbacks);
+
+    let refspec = format!("refs/tags/{name}:refs/tags/{name}");
+    remote
+        .push(&[refspec.as_str()], Some(&mut options))
+        .map_err(|error| GitError::new("push tag", &error))
+}
+
 /// Load the stashes and emit them, or surface the failure.
 fn emit_stashes(repo: &Repository, events: &impl EventSink) {
     match load_stashes(repo) {
@@ -1572,6 +1679,19 @@ mod tests {
                     _ => None,
                 })
                 .expect("expected a StatusLoaded event")
+        }
+
+        /// The tag list from the most recent `TagsLoaded`.
+        fn last_tags(&self) -> Vec<TagInfo> {
+            self.0
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    GitEvent::TagsLoaded(tags) => Some(tags.clone()),
+                    _ => None,
+                })
+                .expect("expected a TagsLoaded event")
         }
 
         /// The stash list from the most recent `StashesLoaded`.
@@ -2404,6 +2524,110 @@ mod tests {
                 .iter()
                 .any(|l| l.kind == DiffLineKind::Header && l.content.contains("a.txt"))
         );
+    }
+
+    #[test]
+    fn create_lightweight_tag_lists_it_against_its_target() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let head = short_sha(repo.head().unwrap().target().unwrap());
+
+        process(
+            &repo,
+            GitCommand::CreateTag {
+                name: "v1.0".into(),
+                message: None,
+            },
+            &events,
+        );
+
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::TagCreated(name) if name == "v1.0"))
+        );
+        let tags = events.last_tags();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "v1.0");
+        assert_eq!(tags[0].target, head);
+        assert!(!tags[0].is_annotated);
+        assert!(tags[0].message.is_none());
+    }
+
+    #[test]
+    fn create_annotated_tag_carries_its_message() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+
+        process(
+            &repo,
+            GitCommand::CreateTag {
+                name: "v2.0".into(),
+                message: Some("release two".into()),
+            },
+            &events,
+        );
+
+        let tags = events.last_tags();
+        let tag = tags.iter().find(|t| t.name == "v2.0").expect("the tag");
+        assert!(tag.is_annotated);
+        assert_eq!(tag.message.as_deref(), Some("release two"));
+    }
+
+    #[test]
+    fn delete_tag_removes_it_from_the_list() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        process(
+            &repo,
+            GitCommand::CreateTag {
+                name: "v1.0".into(),
+                message: None,
+            },
+            &events,
+        );
+        assert_eq!(events.last_tags().len(), 1);
+
+        process(&repo, GitCommand::DeleteTag("v1.0".into()), &events);
+
+        assert!(events.last_tags().is_empty());
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::TagDeleted(name) if name == "v1.0"))
+        );
+    }
+
+    #[test]
+    fn push_tag_publishes_it_to_the_remote() {
+        let remote = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote.path()).unwrap();
+
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+        let origin = repo.remote("origin", remote.path().to_str().unwrap()).unwrap();
+        drop(origin);
+        process(
+            &repo,
+            GitCommand::CreateTag {
+                name: "v1.0".into(),
+                message: None,
+            },
+            &events,
+        );
+
+        process(&repo, GitCommand::PushTag("v1.0".into()), &events);
+
+        assert!(events.events().iter().any(|e| matches!(e, GitEvent::Pushed)));
+        // The tag now exists on the remote.
+        let remote_repo = Repository::open(remote.path()).unwrap();
+        assert!(remote_repo.revparse_single("refs/tags/v1.0").is_ok());
     }
 
     /// The outcome of the most recent `Merged` event.

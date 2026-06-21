@@ -15,7 +15,7 @@ use iced::{Subscription, Task};
 
 use crate::git::{
     self, BranchInfo, CommitDetail, CommitInfo, ConflictSide, Diff, FileEntry, GitCommand, GitEvent,
-    HeadInfo, MergeOutcome, StashDiff, StashInfo,
+    HeadInfo, MergeOutcome, StashDiff, StashInfo, TagInfo,
 };
 use crate::ui;
 
@@ -44,6 +44,8 @@ pub enum ViewMode {
     Branches,
     /// The saved stashes: list, apply, pop, and drop.
     Stashes,
+    /// The tags: list, create, delete, and push.
+    Tags,
 }
 
 /// The application root state.
@@ -55,6 +57,7 @@ pub struct App {
     pub history: HistoryState,
     pub branches: BranchesState,
     pub stashes: StashesState,
+    pub tags: TagsState,
     /// Which left-column view is active.
     pub view: ViewMode,
     pub status: StatusBar,
@@ -105,6 +108,18 @@ pub struct StashesState {
     pub selected: Option<usize>,
     /// The loaded Diff of the selected stash.
     pub diff: Option<StashDiff>,
+}
+
+/// The Tags view's state: the loaded tags, the in-progress new-tag name and
+/// message, and which tag (if any) is armed for a confirming delete.
+#[derive(Default)]
+pub struct TagsState {
+    pub tags: Vec<TagInfo>,
+    pub new_name: String,
+    /// Optional annotation message for the new tag (annotated when non-empty).
+    pub message: String,
+    /// The tag awaiting a confirming second Delete press, if any.
+    pub delete_armed: Option<String>,
 }
 
 /// Working Tree and Staging Area contents, the HEAD/branch context, the
@@ -228,6 +243,10 @@ pub enum UiMessage {
     CommitSelected(String),
     /// The new-branch name field changed.
     NewBranchNameChanged(String),
+    /// The new-tag name field changed.
+    NewTagNameChanged(String),
+    /// The new-tag annotation message field changed.
+    TagMessageChanged(String),
     /// The stash message field changed.
     StashMessageChanged(String),
     /// Select a stash in the Stashes view and load its Diff.
@@ -273,6 +292,14 @@ pub enum GitMessage {
     /// Delete all local branches absent from the Remote. First press arms a
     /// confirmation; the second performs it.
     PruneBranches,
+    /// Create a tag at HEAD from the in-progress name (annotated when the
+    /// message field is non-empty).
+    CreateTag,
+    /// Delete the named tag. First press arms a confirmation; the second
+    /// performs it.
+    DeleteTag(String),
+    /// Push the named tag to the Remote.
+    PushTag(String),
     Push,
     Pull,
     /// Update remote-tracking branches from the Remote without merging.
@@ -299,6 +326,7 @@ impl App {
             history: HistoryState::default(),
             branches: BranchesState::default(),
             stashes: StashesState::default(),
+            tags: TagsState::default(),
             view: ViewMode::default(),
             status: StatusBar::default(),
             notification: Notification::default(),
@@ -335,6 +363,7 @@ impl App {
         self.branches.delete_armed = None;
         self.branches.prune_armed = false;
         self.stashes.drop_armed = None;
+        self.tags.delete_armed = None;
 
         match message {
             UiMessage::FileSelected { path, staged } => self.select(path, staged),
@@ -366,6 +395,8 @@ impl App {
             UiMessage::ShowView(view) => self.show_view(view),
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
             UiMessage::NewBranchNameChanged(name) => self.branches.new_name = name,
+            UiMessage::NewTagNameChanged(name) => self.tags.new_name = name,
+            UiMessage::TagMessageChanged(message) => self.tags.message = message,
             UiMessage::StashMessageChanged(message) => self.stashes.message = message,
             UiMessage::StashSelected(index) => self.select_stash(index),
         }
@@ -385,6 +416,7 @@ impl App {
             ViewMode::History => self.dispatch(GitCommand::LoadHistory),
             ViewMode::Branches => self.dispatch(GitCommand::LoadBranches),
             ViewMode::Stashes => self.dispatch(GitCommand::LoadStashes),
+            ViewMode::Tags => self.dispatch(GitCommand::LoadTags),
             ViewMode::Changes => {}
         }
     }
@@ -414,6 +446,10 @@ impl App {
         // And anything but re-pressing the same Drop cancels an armed stash drop.
         if !matches!(message, GitMessage::StashDrop(_)) {
             self.stashes.drop_armed = None;
+        }
+        // And anything but re-pressing the same tag Delete cancels its arm.
+        if !matches!(message, GitMessage::DeleteTag(_)) {
+            self.tags.delete_armed = None;
         }
 
         match message {
@@ -518,6 +554,26 @@ impl App {
                 } else {
                     self.branches.prune_armed = true;
                 }
+            }
+            GitMessage::CreateTag => {
+                let name = self.tags.new_name.trim().to_string();
+                if !name.is_empty() {
+                    let message = self.tags.message.trim();
+                    let message = (!message.is_empty()).then(|| message.to_string());
+                    self.dispatch(GitCommand::CreateTag { name, message });
+                }
+            }
+            GitMessage::DeleteTag(name) => {
+                // First press arms this tag; the confirming second deletes it.
+                if self.tags.delete_armed.as_deref() == Some(name.as_str()) {
+                    self.tags.delete_armed = None;
+                    self.dispatch(GitCommand::DeleteTag(name));
+                } else {
+                    self.tags.delete_armed = Some(name);
+                }
+            }
+            GitMessage::PushTag(name) => {
+                self.start_remote("Pushing tag…", GitCommand::PushTag(name))
             }
             GitMessage::Push => self.start_remote("Pushing…", GitCommand::Push),
             GitMessage::Pull => self.start_remote("Pulling…", GitCommand::Pull),
@@ -698,6 +754,19 @@ impl App {
                     1 => format!("Pruned {}", pruned[0]),
                     n => format!("Pruned {n} branches"),
                 });
+            }
+            GitEvent::TagsLoaded(tags) => {
+                self.tags.tags = tags;
+                self.tags.delete_armed = None;
+            }
+            GitEvent::TagCreated(name) => {
+                self.tags.new_name.clear();
+                self.tags.message.clear();
+                self.notify(format!("Created tag {name}"));
+            }
+            GitEvent::TagDeleted(name) => {
+                self.tags.delete_armed = None;
+                self.notify(format!("Deleted tag {name}"));
             }
             GitEvent::Pushed => {
                 self.operation = None;
@@ -1000,6 +1069,7 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Character("2") if command => Message::Ui(UiMessage::ShowView(ViewMode::History)),
         Key::Character("3") if command => Message::Ui(UiMessage::ShowView(ViewMode::Branches)),
         Key::Character("4") if command => Message::Ui(UiMessage::ShowView(ViewMode::Stashes)),
+        Key::Character("5") if command => Message::Ui(UiMessage::ShowView(ViewMode::Tags)),
         Key::Named(Named::F5) => Message::Git(GitMessage::Refresh),
         Key::Character("r") if command => Message::Git(GitMessage::Refresh),
         Key::Named(Named::Enter) if command => Message::Git(GitMessage::Commit),

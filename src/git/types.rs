@@ -44,6 +44,18 @@ pub enum GitCommand {
     LoadCommitDetail(String),
     /// Load the local branches and their sync state.
     LoadBranches,
+    /// Load the tags, pointing at their target Commits.
+    LoadTags,
+    /// Create a tag at HEAD. With a non-empty `message` it is annotated;
+    /// otherwise it is lightweight.
+    CreateTag {
+        name: String,
+        message: Option<String>,
+    },
+    /// Delete the named tag.
+    DeleteTag(String),
+    /// Push the named tag to the Remote.
+    PushTag(String),
     /// Switch the Working Tree and HEAD to the named local branch.
     Checkout(String),
     /// Create a new local branch at HEAD and switch to it.
@@ -107,6 +119,12 @@ pub enum GitEvent {
     CommitDetailLoaded(CommitDetail),
     /// The local branches and their sync state.
     BranchesLoaded(Vec<BranchInfo>),
+    /// The tags and their target Commits.
+    TagsLoaded(Vec<TagInfo>),
+    /// A tag was created; carries its name.
+    TagCreated(String),
+    /// A tag was deleted; carries its name.
+    TagDeleted(String),
     /// A branch was checked out (or created and checked out); carries its name.
     CheckedOut(String),
     /// A branch was deleted; carries its name.
@@ -198,6 +216,21 @@ pub struct BranchInfo {
     pub ahead: usize,
     /// Commits behind the upstream.
     pub behind: usize,
+}
+
+/// One tag in the Tags view: its name and the Commit it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagInfo {
+    /// The tag's short name (the `v1.0` in `refs/tags/v1.0`).
+    pub name: String,
+    /// The short SHA of the Commit the tag ultimately points to.
+    pub target: String,
+    /// The summary line of that Commit.
+    pub summary: String,
+    /// The annotation message, for an annotated tag (`None` for lightweight).
+    pub message: Option<String>,
+    /// An annotated tag (a tag object), rather than a lightweight ref.
+    pub is_annotated: bool,
 }
 
 /// One saved stash in the Stashes view.
