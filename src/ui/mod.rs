@@ -13,13 +13,13 @@ mod worddiff;
 use iced::widget::canvas;
 use iced::widget::{
     button, checkbox, column, container, mouse_area, rich_text, row, scrollable, space, span,
-    stack, text, text_input,
+    stack, text, text_editor, text_input,
 };
 use iced::{Center, Element, Fill, Font, Length, Point, Rectangle, Renderer, Theme};
 
 use crate::app::{
-    App, ContextMenu, GitMessage, HistoryState, MenuTarget, Message, RepoState, Selection,
-    UiMessage, ViewMode,
+    App, ConflictEdit, ContextMenu, GitMessage, HistoryState, MenuTarget, Message, RepoState,
+    Selection, UiMessage, ViewMode,
 };
 use crate::git::{
     BranchInfo, ChangeKind, CommitInfo, ConflictFile, ConflictSegment, ConflictSide, Diff, DiffLine,
@@ -48,12 +48,14 @@ pub fn root(app: &App) -> Element<'_, Message> {
 
     let right: Element<Message> = match app.view {
         ViewMode::Changes => {
-            // A selected conflicted file shows the region-by-region resolver;
-            // any other selection shows its diff.
-            let top: Element<Message> = match &app.repo.conflict {
-                Some(file)
-                    if app.repo.selected.as_ref().is_some_and(|s| s.path == file.path) =>
-                {
+            // A conflicted file under manual edit shows the editor; otherwise the
+            // region-by-region resolver; any other selection shows its diff.
+            let selected_path = app.repo.selected.as_ref().map(|s| s.path.as_str());
+            let top: Element<Message> = match (&app.repo.editing, &app.repo.conflict) {
+                (Some(edit), _) if selected_path == Some(edit.path.as_str()) => {
+                    conflict_editor_view(edit)
+                }
+                (_, Some(file)) if selected_path == Some(file.path.as_str()) => {
                     conflict_view(file)
                 }
                 _ => diff_view(&app.repo),
@@ -840,6 +842,10 @@ fn conflict_view(file: &ConflictFile) -> Element<'_, Message> {
                 .size(13)
                 .font(Font::MONOSPACE)
                 .color(style::TEXT),
+            button(text("Edit").size(11))
+                .on_press(Message::Ui(UiMessage::EditConflict))
+                .padding([3, 9])
+                .style(style::ghost),
             space::horizontal(),
             text("Whole file:").size(11).color(style::TEXT_FAINT),
             all("Ours", ConflictSide::Ours),
@@ -874,6 +880,43 @@ fn conflict_view(file: &ConflictFile) -> Element<'_, Message> {
         .width(Fill);
 
     column![header, body].spacing(10).into()
+}
+
+/// The manual conflict editor: a free-form text editor over the conflicted file's
+/// raw content (markers and all), for merges that ours/theirs/both can't express.
+/// Saving writes the buffer back and, if no markers remain, stages the file.
+fn conflict_editor_view(edit: &ConflictEdit) -> Element<'_, Message> {
+    let header = container(
+        row![
+            text(edit.path.clone())
+                .size(13)
+                .font(Font::MONOSPACE)
+                .color(style::TEXT),
+            space::horizontal(),
+            text("Manual edit").size(11).color(style::TEXT_FAINT),
+            button(text("Cancel").size(11))
+                .on_press(Message::Ui(UiMessage::CancelConflictEdit))
+                .padding([3, 9])
+                .style(style::ghost),
+            button(text("Save").size(11))
+                .on_press(Message::Git(GitMessage::SaveConflictEdit))
+                .padding([3, 9])
+                .style(style::primary),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    )
+    .style(style::diff_header)
+    .padding([7, 12])
+    .width(Fill);
+
+    let editor = text_editor(&edit.content)
+        .on_action(|action| Message::Ui(UiMessage::ConflictEdited(action)))
+        .font(Font::MONOSPACE)
+        .height(Fill)
+        .padding(8);
+
+    column![header, editor].spacing(10).height(Fill).into()
 }
 
 /// One conflict region as a card: a labelled bar with per-region Ours / Theirs /

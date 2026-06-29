@@ -108,6 +108,9 @@ pub enum GitCommand {
         index: usize,
         side: ConflictSide,
     },
+    /// Save hand-edited content for a conflicted file to the Working Tree. When the
+    /// saved content has no conflict markers left, the file is staged.
+    SaveConflict { path: String, content: String },
     /// Abort an in-progress merge, restoring the pre-merge state.
     AbortMerge,
     /// Apply the stash at the given index without removing it.
@@ -191,6 +194,9 @@ pub enum GitEvent {
 pub struct ConflictFile {
     pub path: String,
     pub segments: Vec<ConflictSegment>,
+    /// The file's full Working Tree content, markers and all, as the seed for the
+    /// manual editor (the fallback when ours/theirs/both can't express the merge).
+    pub raw: String,
 }
 
 /// One ordered piece of a [`ConflictFile`]: either agreed-upon context, or a

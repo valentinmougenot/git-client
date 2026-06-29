@@ -163,6 +163,16 @@ pub struct RepoState {
     /// The selected conflicted file parsed into regions, for region-by-region
     /// resolution. Set when a conflicted file is selected; cleared otherwise.
     pub conflict: Option<ConflictFile>,
+    /// The in-progress manual edit of the selected conflicted file, when the user
+    /// has opened the editor. The fallback when ours/theirs/both can't express the
+    /// merge; cleared when saved, cancelled, or the selection changes.
+    pub editing: Option<ConflictEdit>,
+}
+
+/// A conflicted file open in the manual editor: which file, and its live buffer.
+pub struct ConflictEdit {
+    pub path: String,
+    pub content: iced::widget::text_editor::Content,
 }
 
 /// A file in the File List, identified by its path and which side it is on.
@@ -287,6 +297,13 @@ pub enum UiMessage {
     StashMessageChanged(String),
     /// Select a stash in the Stashes view and load its Diff.
     StashSelected(usize),
+    /// Open the manual editor for the selected conflicted file, seeded with its
+    /// current Working Tree content (markers and all).
+    EditConflict,
+    /// An edit inside the manual conflict editor; applied to the live buffer.
+    ConflictEdited(iced::widget::text_editor::Action),
+    /// Close the manual conflict editor without saving.
+    CancelConflictEdit,
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +346,8 @@ pub enum GitMessage {
         index: usize,
         side: ConflictSide,
     },
+    /// Save the manual editor's buffer as the conflicted file's content.
+    SaveConflictEdit,
     /// Abort the in-progress merge, restoring the pre-merge state.
     AbortMerge,
     /// Delete all local branches absent from the Remote. First press arms a
@@ -457,6 +476,24 @@ impl App {
             UiMessage::TagMessageChanged(message) => self.tags.message = message,
             UiMessage::StashMessageChanged(message) => self.stashes.message = message,
             UiMessage::StashSelected(index) => self.select_stash(index),
+            UiMessage::EditConflict => self.open_conflict_editor(),
+            UiMessage::ConflictEdited(action) => {
+                if let Some(edit) = &mut self.repo.editing {
+                    edit.content.perform(action);
+                }
+            }
+            UiMessage::CancelConflictEdit => self.repo.editing = None,
+        }
+    }
+
+    /// Open the manual editor for the selected conflicted file, seeding the buffer
+    /// with the file's current Working Tree content (markers included).
+    fn open_conflict_editor(&mut self) {
+        if let Some(file) = &self.repo.conflict {
+            self.repo.editing = Some(ConflictEdit {
+                path: file.path.clone(),
+                content: iced::widget::text_editor::Content::with_text(&file.raw),
+            });
         }
     }
 
@@ -591,6 +628,14 @@ impl App {
             }
             GitMessage::ResolveHunk { path, index, side } => {
                 self.dispatch(GitCommand::ResolveHunk { path, index, side })
+            }
+            GitMessage::SaveConflictEdit => {
+                if let Some(edit) = self.repo.editing.take() {
+                    self.dispatch(GitCommand::SaveConflict {
+                        path: edit.path,
+                        content: edit.content.text(),
+                    });
+                }
             }
             GitMessage::AbortMerge => self.dispatch(GitCommand::AbortMerge),
             GitMessage::CreateBranch => {
@@ -933,6 +978,10 @@ impl App {
     /// Select a file. A conflicted file loads its parsed regions (for region-by-
     /// region resolution); any other file loads its Diff.
     fn select(&mut self, path: String, staged: bool) {
+        // Switching files abandons any open manual edit of the previous one.
+        if self.repo.editing.as_ref().is_some_and(|e| e.path != path) {
+            self.repo.editing = None;
+        }
         self.repo.selected = Some(Selection {
             path: path.clone(),
             staged,
@@ -1063,6 +1112,7 @@ impl App {
             .is_some_and(|s| !s.staged && self.repo.conflicted.iter().any(|e| e.path == s.path));
         if !still_conflicted {
             self.repo.conflict = None;
+            self.repo.editing = None;
         }
     }
 
@@ -1677,6 +1727,70 @@ mod tests {
         update(&mut app, Message::Git(GitMessage::Commit));
         assert!(app.commit.committing);
         assert!(app.status.message.is_none());
+    }
+
+    #[test]
+    fn editing_a_conflict_seeds_the_buffer_then_save_clears_it() {
+        let mut app = App::new();
+        app.repo.selected = Some(Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        });
+        app.repo.conflict = Some(ConflictFile {
+            path: "a.txt".to_string(),
+            segments: Vec::new(),
+            raw: "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>>\n".to_string(),
+        });
+
+        // Opening the editor seeds it from the conflict's raw content.
+        update(&mut app, Message::Ui(UiMessage::EditConflict));
+        let edit = app.repo.editing.as_ref().expect("editor should be open");
+        assert_eq!(edit.path, "a.txt");
+        assert!(edit.content.text().contains("<<<<<<<"));
+
+        // Saving closes the editor (the worker takes over from here).
+        update(&mut app, Message::Git(GitMessage::SaveConflictEdit));
+        assert!(app.repo.editing.is_none());
+    }
+
+    #[test]
+    fn cancelling_a_conflict_edit_closes_the_editor() {
+        let mut app = App::new();
+        app.repo.selected = Some(Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        });
+        app.repo.conflict = Some(ConflictFile {
+            path: "a.txt".to_string(),
+            segments: Vec::new(),
+            raw: "x\n".to_string(),
+        });
+
+        update(&mut app, Message::Ui(UiMessage::EditConflict));
+        assert!(app.repo.editing.is_some());
+
+        update(&mut app, Message::Ui(UiMessage::CancelConflictEdit));
+        assert!(app.repo.editing.is_none());
+    }
+
+    #[test]
+    fn switching_files_abandons_an_open_conflict_edit() {
+        let mut app = App::new();
+        app.repo.unstaged = vec![entry("b.txt", ChangeKind::Modified)];
+        app.repo.editing = Some(ConflictEdit {
+            path: "a.txt".to_string(),
+            content: iced::widget::text_editor::Content::with_text("x"),
+        });
+
+        // Selecting a different file drops the stale edit.
+        update(
+            &mut app,
+            Message::Ui(UiMessage::FileSelected {
+                path: "b.txt".to_string(),
+                staged: false,
+            }),
+        );
+        assert!(app.repo.editing.is_none());
     }
 
     #[test]

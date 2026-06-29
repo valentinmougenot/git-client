@@ -292,6 +292,22 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
                 Err(error) => events.emit(GitEvent::Error(error)),
             }
         }
+        GitCommand::SaveConflict { path, content } => {
+            match save_conflict(repo, &path, &content) {
+                Ok(resolved) => {
+                    // The file's conflict status (and the list) may have changed.
+                    emit_status(repo, events);
+                    // Still conflicted: refresh the parsed regions and the editor
+                    // seed; fully resolved, it has left the list, so nothing to show.
+                    if !resolved
+                        && let Ok(file) = load_conflict(repo, &path)
+                    {
+                        events.emit(GitEvent::ConflictLoaded(file));
+                    }
+                }
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+        }
         GitCommand::AbortMerge => {
             if let Err(error) = abort_merge(repo) {
                 events.emit(GitEvent::Error(error));
@@ -1625,7 +1641,31 @@ fn load_conflict(repo: &Repository, path: &str) -> Result<ConflictFile, GitError
     Ok(ConflictFile {
         path: path.to_string(),
         segments: parse_conflict(&content),
+        raw: content,
     })
+}
+
+/// Save hand-edited `content` for a conflicted file to the Working Tree. Returns
+/// whether the file is now fully resolved (no conflict markers left) — in which
+/// case it is also staged, finishing the resolution for that file.
+fn save_conflict(repo: &Repository, path: &str, content: &str) -> Result<bool, GitError> {
+    let make = |error: &git2::Error| GitError::new("resolve conflict", error);
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| GitError::custom("resolve conflict", "no working directory"))?
+        .to_path_buf();
+    std::fs::write(workdir.join(path), content)
+        .map_err(|error| GitError::custom("resolve conflict", error.to_string()))?;
+
+    let resolved = !content.contains("<<<<<<<");
+    if resolved {
+        let mut index = repo.index().map_err(|e| make(&e))?;
+        let path_ref = Path::new(path);
+        let _ = index.conflict_remove(path_ref);
+        index.add_path(path_ref).map_err(|e| make(&e))?;
+        index.write().map_err(|e| make(&e))?;
+    }
+    Ok(resolved)
 }
 
 /// Split a file's content into [`ConflictSegment`]s by its conflict markers.
@@ -3375,6 +3415,63 @@ mod tests {
             format!("A2\n{mid}Z\n")
         );
         assert!(events.last_conflicted().is_empty());
+    }
+
+    #[test]
+    fn load_conflict_carries_the_raw_content_for_the_editor() {
+        let (_dir, repo, events) = conflicted_repo();
+
+        process(&repo, GitCommand::LoadConflict("a.txt".into()), &events);
+
+        // The raw seed keeps the markers, so the editor opens on the real file.
+        let raw = last_conflict(&events).raw;
+        assert!(raw.contains("<<<<<<<"));
+        assert!(raw.contains("master"));
+        assert!(raw.contains("feature"));
+    }
+
+    #[test]
+    fn save_conflict_with_no_markers_writes_and_stages_the_file() {
+        let (dir, repo, events) = conflicted_repo();
+
+        // A hand-merged result with no markers left resolves the file.
+        process(
+            &repo,
+            GitCommand::SaveConflict {
+                path: "a.txt".into(),
+                content: "merged by hand\n".into(),
+            },
+            &events,
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "merged by hand\n"
+        );
+        assert!(events.last_conflicted().is_empty());
+        let (_unstaged, staged) = events.last_status();
+        assert_eq!(paths(&staged), ["a.txt"]);
+    }
+
+    #[test]
+    fn save_conflict_keeping_markers_leaves_the_file_conflicted() {
+        let (dir, repo, events) = conflicted_repo();
+
+        // Saving content that still has markers writes it but keeps the conflict,
+        // and re-emits the parsed regions for the resolver.
+        let content = "<<<<<<< HEAD\nmaster\n=======\nfeature\n>>>>>>> incoming\ntail\n";
+        process(
+            &repo,
+            GitCommand::SaveConflict {
+                path: "a.txt".into(),
+                content: content.into(),
+            },
+            &events,
+        );
+
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), content);
+        assert_eq!(paths(&events.last_conflicted()), ["a.txt"]);
+        assert_eq!(last_conflict(&events).raw, content);
     }
 }
 
