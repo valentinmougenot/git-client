@@ -70,6 +70,16 @@ pub enum GitCommand {
     CherryPick(String),
     /// Load the local branches and their sync state.
     LoadBranches,
+    /// Load the configured remotes and their URLs.
+    LoadRemotes,
+    /// Add a remote with the given name and URL.
+    AddRemote { name: String, url: String },
+    /// Rename a remote.
+    RenameRemote { from: String, to: String },
+    /// Change a remote's URL.
+    SetRemoteUrl { name: String, url: String },
+    /// Remove a remote.
+    RemoveRemote(String),
     /// Load the tags, pointing at their target Commits.
     LoadTags,
     /// Create a tag at HEAD. With a non-empty `message` it is annotated;
@@ -166,6 +176,16 @@ pub enum GitEvent {
     CherryPicked { outcome: CherryPickOutcome },
     /// The local branches and their sync state.
     BranchesLoaded(Vec<BranchInfo>),
+    /// The configured remotes and their URLs.
+    RemotesLoaded(Vec<RemoteInfo>),
+    /// A remote was added; carries its name.
+    RemoteAdded(String),
+    /// A remote was renamed; carries its new name.
+    RemoteRenamed(String),
+    /// A remote's URL was changed; carries its name.
+    RemoteUrlUpdated(String),
+    /// A remote was removed; carries its name.
+    RemoteRemoved(String),
     /// The tags and their target Commits.
     TagsLoaded(Vec<TagInfo>),
     /// A tag was created; carries its name.
@@ -355,6 +375,13 @@ pub struct BranchInfo {
     pub ahead: usize,
     /// Commits behind the upstream.
     pub behind: usize,
+}
+
+/// One configured remote: its name and fetch URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub url: String,
 }
 
 /// One tag in the Tags view: its name and the Commit it points at.

@@ -181,6 +181,41 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             emit_status(repo, events);
         }
         GitCommand::LoadBranches => emit_branches(repo, events),
+        GitCommand::LoadRemotes => emit_remotes(repo, events),
+        GitCommand::AddRemote { name, url } => {
+            match repo.remote(&name, &url) {
+                Ok(_) => events.emit(GitEvent::RemoteAdded(name)),
+                Err(error) => events.emit(GitEvent::Error(GitError::new("add remote", &error))),
+            }
+            emit_remotes(repo, events);
+        }
+        GitCommand::RenameRemote { from, to } => {
+            match repo.remote_rename(&from, &to) {
+                Ok(_) => events.emit(GitEvent::RemoteRenamed(to)),
+                Err(error) => {
+                    events.emit(GitEvent::Error(GitError::new("rename remote", &error)))
+                }
+            }
+            emit_remotes(repo, events);
+        }
+        GitCommand::SetRemoteUrl { name, url } => {
+            match repo.remote_set_url(&name, &url) {
+                Ok(()) => events.emit(GitEvent::RemoteUrlUpdated(name)),
+                Err(error) => {
+                    events.emit(GitEvent::Error(GitError::new("set remote url", &error)))
+                }
+            }
+            emit_remotes(repo, events);
+        }
+        GitCommand::RemoveRemote(name) => {
+            match repo.remote_delete(&name) {
+                Ok(()) => events.emit(GitEvent::RemoteRemoved(name)),
+                Err(error) => {
+                    events.emit(GitEvent::Error(GitError::new("remove remote", &error)))
+                }
+            }
+            emit_remotes(repo, events);
+        }
         GitCommand::LoadTags => emit_tags(repo, events),
         GitCommand::CreateTag { name, message } => {
             match create_tag(repo, &name, message.as_deref()) {
@@ -1237,6 +1272,32 @@ fn emit_branches(repo: &Repository, events: &impl EventSink) {
         Ok(branches) => events.emit(GitEvent::BranchesLoaded(branches)),
         Err(error) => events.emit(GitEvent::Error(GitError::new("load branches", &error))),
     }
+}
+
+/// Read the configured remotes and emit them, or surface the failure.
+fn emit_remotes(repo: &Repository, events: &impl EventSink) {
+    match load_remotes(repo) {
+        Ok(remotes) => events.emit(GitEvent::RemotesLoaded(remotes)),
+        Err(error) => events.emit(GitEvent::Error(GitError::new("load remotes", &error))),
+    }
+}
+
+/// List the configured remotes and their URLs, sorted by name.
+fn load_remotes(repo: &Repository) -> Result<Vec<RemoteInfo>, git2::Error> {
+    let mut remotes = Vec::new();
+    for name in repo.remotes()?.iter().flatten().flatten() {
+        let url = repo
+            .find_remote(name)
+            .ok()
+            .and_then(|r| r.url().ok().map(str::to_string))
+            .unwrap_or_default();
+        remotes.push(RemoteInfo {
+            name: name.to_string(),
+            url,
+        });
+    }
+    remotes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(remotes)
 }
 
 /// Read the tags and emit them, or surface the failure.
@@ -3815,6 +3876,76 @@ mod tests {
         assert_eq!(results.len(), 1);
         // The match came from the file path, not the (unrelated) commit message.
         assert!(!results[0].summary.contains("secret_config"));
+    }
+
+    /// The most recent `RemotesLoaded` payload.
+    fn last_remotes(events: &Collector) -> Vec<RemoteInfo> {
+        events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::RemotesLoaded(remotes) => Some(remotes),
+                _ => None,
+            })
+            .expect("expected a RemotesLoaded event")
+    }
+
+    #[test]
+    fn remotes_can_be_added_listed_renamed_url_changed_and_removed() {
+        let (_dir, repo) = temp_repo();
+        let events = Collector::default();
+
+        process(
+            &repo,
+            GitCommand::AddRemote {
+                name: "origin".into(),
+                url: "https://example.com/r.git".into(),
+            },
+            &events,
+        );
+        let remotes = last_remotes(&events);
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].name, "origin");
+        assert_eq!(remotes[0].url, "https://example.com/r.git");
+
+        process(
+            &repo,
+            GitCommand::SetRemoteUrl {
+                name: "origin".into(),
+                url: "https://example.com/new.git".into(),
+            },
+            &events,
+        );
+        assert_eq!(last_remotes(&events)[0].url, "https://example.com/new.git");
+
+        process(
+            &repo,
+            GitCommand::RenameRemote {
+                from: "origin".into(),
+                to: "upstream".into(),
+            },
+            &events,
+        );
+        assert_eq!(last_remotes(&events)[0].name, "upstream");
+
+        process(&repo, GitCommand::RemoveRemote("upstream".into()), &events);
+        assert!(last_remotes(&events).is_empty());
+    }
+
+    #[test]
+    fn removing_an_unknown_remote_reports_an_error() {
+        let (_dir, repo) = temp_repo();
+        let events = Collector::default();
+
+        process(&repo, GitCommand::RemoveRemote("ghost".into()), &events);
+
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::Error(_)))
+        );
     }
 
     /// The most recent `ComparisonLoaded` payload.

@@ -23,7 +23,8 @@ use crate::app::{
 };
 use crate::git::{
     BlameFile, BranchInfo, ChangeKind, CommitInfo, Comparison, ConflictFile, ConflictSegment,
-    ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo, ResetKind, StashInfo, TagInfo,
+    ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo, RemoteInfo, ResetKind,
+    StashInfo, TagInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -40,6 +41,7 @@ pub fn root(app: &App) -> Element<'_, Message> {
         ViewMode::Branches => branches_list(app),
         ViewMode::Stashes => stashes_list(app),
         ViewMode::Tags => tags_list(app),
+        ViewMode::Remotes => remotes_list(app),
     };
     let left = container(column![view_tabs(app), left_body])
         .style(style::panel)
@@ -98,6 +100,11 @@ pub fn root(app: &App) -> Element<'_, Message> {
             .height(Fill)
             .into(),
         ViewMode::Tags => container(tags_detail(app))
+            .style(style::panel)
+            .width(Length::FillPortion(3))
+            .height(Fill)
+            .into(),
+        ViewMode::Remotes => container(remotes_detail(app))
             .style(style::panel)
             .width(Length::FillPortion(3))
             .height(Fill)
@@ -308,6 +315,7 @@ fn view_tabs(app: &App) -> Element<'_, Message> {
     let row2 = row![
         tab(&stashes_label, ViewMode::Stashes, app.view),
         tab(&tags_label, ViewMode::Tags, app.view),
+        tab("Remotes", ViewMode::Remotes, app.view),
     ]
     .spacing(4);
 
@@ -1794,6 +1802,147 @@ fn tags_detail(app: &App) -> Element<'_, Message> {
         .center(Fill)
         .padding(12)
         .into()
+}
+
+// ── Remotes List ──────────────────────────────────────────────────────────
+
+/// The left column in the Remotes view: an "add remote" form (name + URL), then
+/// the configured remotes. Clicking a remote opens its detail panel.
+fn remotes_list(app: &App) -> Element<'_, Message> {
+    let mut items: Vec<Element<Message>> = Vec::new();
+
+    let can_add =
+        !app.remotes.new_name.trim().is_empty() && !app.remotes.new_url.trim().is_empty();
+    let name = text_input("Name (e.g. origin)", &app.remotes.new_name)
+        .on_input(|value| Message::Ui(UiMessage::NewRemoteNameChanged(value)))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let url = text_input("URL (https or ssh)", &app.remotes.new_url)
+        .on_input(|value| Message::Ui(UiMessage::NewRemoteUrlChanged(value)))
+        .on_submit(Message::Git(GitMessage::AddRemote))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let add = pill("+", 15, "Add", GitMessage::AddRemote, Tone::Normal, can_add);
+    items.push(name.into());
+    items.push(row![url, add].spacing(6).align_y(Center).into());
+
+    items.push(gap(8.0));
+    items.push(branch_section_label("REMOTES", app.remotes.remotes.len()));
+    if app.remotes.remotes.is_empty() {
+        items.push(placeholder("No remotes configured"));
+    } else {
+        let selected = app.remotes.selected.as_deref();
+        for remote in &app.remotes.remotes {
+            items.push(remote_row(remote, selected == Some(remote.name.as_str())));
+        }
+    }
+
+    scrollable(column(items).spacing(4).padding(12))
+        .height(Fill)
+        .into()
+}
+
+/// One remote: its name and URL. Clicking selects it for the detail panel.
+fn remote_row<'a>(remote: &RemoteInfo, selected: bool) -> Element<'a, Message> {
+    let label = column![
+        row![
+            text("🌐").size(12),
+            text(remote.name.clone()).size(14).color(style::TEXT),
+        ]
+        .spacing(8)
+        .align_y(Center),
+        text(remote.url.clone()).size(11).color(style::TEXT_FAINT),
+    ]
+    .spacing(2)
+    .width(Fill);
+
+    button(label)
+        .on_press(Message::Ui(UiMessage::RemoteSelected(remote.name.clone())))
+        .width(Fill)
+        .padding([6, 8])
+        .style(style::file_item(selected))
+        .into()
+}
+
+/// The right panel in the Remotes view: the selected remote's editable URL and
+/// name, plus Remove. Empty hint when nothing is selected.
+fn remotes_detail(app: &App) -> Element<'_, Message> {
+    let Some(name) = &app.remotes.selected else {
+        let lines = column![
+            text("Remotes").size(16).color(style::TEXT),
+            text("Add a remote on the left, or pick one to edit it")
+                .size(12)
+                .color(style::TEXT_FAINT),
+        ]
+        .spacing(8);
+        return container(lines.align_x(Center)).center(Fill).padding(12).into();
+    };
+
+    let title = row![
+        text("🌐").size(14),
+        text(name.clone()).size(16).color(style::TEXT),
+    ]
+    .spacing(8)
+    .align_y(Center);
+
+    // Edit URL.
+    let url_input = text_input("URL", &app.remotes.edit_url)
+        .on_input(|value| Message::Ui(UiMessage::RemoteUrlChanged(value)))
+        .on_submit(Message::Git(GitMessage::UpdateRemoteUrl))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let url_can = !app.remotes.edit_url.trim().is_empty();
+    let url_row = row![
+        url_input,
+        pill("", 0, "Update URL", GitMessage::UpdateRemoteUrl, Tone::Normal, url_can),
+    ]
+    .spacing(6)
+    .align_y(Center);
+
+    // Rename.
+    let rename_input = text_input("New name", &app.remotes.rename_to)
+        .on_input(|value| Message::Ui(UiMessage::RemoteRenameChanged(value)))
+        .on_submit(Message::Git(GitMessage::RenameRemote))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let rename_can =
+        !app.remotes.rename_to.trim().is_empty() && app.remotes.rename_to.trim() != name.as_str();
+    let rename_row = row![
+        rename_input,
+        pill("", 0, "Rename", GitMessage::RenameRemote, Tone::Normal, rename_can),
+    ]
+    .spacing(6)
+    .align_y(Center);
+
+    // Remove (armed confirm).
+    let remove_label = if app.remotes.remove_armed {
+        "Confirm remove?"
+    } else {
+        "Remove remote"
+    };
+    let remove = pill("", 0, remove_label, GitMessage::RemoveRemote, Tone::Danger, true);
+
+    let body = column![
+        title,
+        field_label("Fetch / push URL"),
+        url_row,
+        field_label("Rename"),
+        rename_row,
+        gap(8.0),
+        remove,
+    ]
+    .spacing(8);
+
+    container(body).padding(16).width(Fill).height(Fill).into()
+}
+
+/// A small faint caption above a form field.
+fn field_label<'a>(label: &str) -> Element<'a, Message> {
+    text(label.to_string()).size(11).color(style::TEXT_MUTED).into()
 }
 
 // ── Commit Detail ────────────────────────────────────────────────────────

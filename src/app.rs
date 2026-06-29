@@ -16,7 +16,7 @@ use iced::{Point, Subscription, Task};
 use crate::git::{
     self, BlameFile, BranchInfo, CherryPickOutcome, CommitDetail, CommitInfo, Comparison,
     ConflictFile, ConflictSide, Diff, FileEntry, GitCommand, GitEvent, HeadInfo, MergeOutcome,
-    ResetKind, RevertOutcome, StashDiff, StashInfo, TagInfo,
+    RemoteInfo, ResetKind, RevertOutcome, StashDiff, StashInfo, TagInfo,
 };
 use crate::ui;
 
@@ -47,6 +47,8 @@ pub enum ViewMode {
     Stashes,
     /// The tags: list, create, delete, and push.
     Tags,
+    /// The remotes: list, add, rename, change URL, and remove.
+    Remotes,
 }
 
 /// The application root state.
@@ -59,6 +61,7 @@ pub struct App {
     pub branches: BranchesState,
     pub stashes: StashesState,
     pub tags: TagsState,
+    pub remotes: RemotesState,
     /// Which left-column view is active.
     pub view: ViewMode,
     pub status: StatusBar,
@@ -147,6 +150,24 @@ pub struct StashesState {
     pub selected: Option<usize>,
     /// The loaded Diff of the selected stash.
     pub diff: Option<StashDiff>,
+}
+
+/// The Remotes view's state: the loaded remotes, the in-progress add form, and
+/// the selected remote's editable URL / rename fields.
+#[derive(Default)]
+pub struct RemotesState {
+    pub remotes: Vec<RemoteInfo>,
+    /// The "add remote" form.
+    pub new_name: String,
+    pub new_url: String,
+    /// The selected remote (whose detail panel is shown), if any.
+    pub selected: Option<String>,
+    /// The selected remote's URL, edited in the detail panel.
+    pub edit_url: String,
+    /// A new name for the selected remote, edited in the detail panel.
+    pub rename_to: String,
+    /// Whether Remove is armed, awaiting a confirming second press.
+    pub remove_armed: bool,
 }
 
 /// The Tags view's state: the loaded tags, the in-progress new-tag name and
@@ -336,6 +357,16 @@ pub enum UiMessage {
     ShowFileHistory(String),
     /// Leave a filtered history (search or file) and show the full graph again.
     ClearHistoryFilter,
+    /// The "add remote" name field changed.
+    NewRemoteNameChanged(String),
+    /// The "add remote" URL field changed.
+    NewRemoteUrlChanged(String),
+    /// Select a remote in the Remotes view (loads its detail fields).
+    RemoteSelected(String),
+    /// The selected remote's URL field (detail panel) changed.
+    RemoteUrlChanged(String),
+    /// The selected remote's rename field (detail panel) changed.
+    RemoteRenameChanged(String),
     /// Jump to a Commit in the History view (e.g. from a Blame line), loading its
     /// detail even when it sits outside the loaded history window.
     ShowCommit(String),
@@ -377,6 +408,15 @@ pub enum GitMessage {
     Merge(String),
     /// Compare the named branch against the current branch (diff current → branch).
     CompareWithCurrent(String),
+    /// Add a remote from the "add remote" form (name + URL).
+    AddRemote,
+    /// Change the selected remote's URL to the detail panel's value.
+    UpdateRemoteUrl,
+    /// Rename the selected remote to the detail panel's value.
+    RenameRemote,
+    /// Remove the selected remote. First press arms a confirmation; the second
+    /// performs it.
+    RemoveRemote,
     /// Resolve a whole conflicted file by taking one side (ours/theirs/both).
     ResolveConflict { path: String, side: ConflictSide },
     /// Resolve one conflict region of a file by taking one side.
@@ -434,6 +474,7 @@ impl App {
             branches: BranchesState::default(),
             stashes: StashesState::default(),
             tags: TagsState::default(),
+            remotes: RemotesState::default(),
             view: ViewMode::default(),
             status: StatusBar::default(),
             notification: Notification::default(),
@@ -581,7 +622,22 @@ impl App {
             }
             UiMessage::ShowCommit(sha) => self.navigate_to_commit(sha),
             UiMessage::CloseComparison => self.branches.comparison = None,
+            UiMessage::NewRemoteNameChanged(name) => self.remotes.new_name = name,
+            UiMessage::NewRemoteUrlChanged(url) => self.remotes.new_url = url,
+            UiMessage::RemoteSelected(name) => self.select_remote(name),
+            UiMessage::RemoteUrlChanged(url) => self.remotes.edit_url = url,
+            UiMessage::RemoteRenameChanged(name) => self.remotes.rename_to = name,
         }
+    }
+
+    /// Select a remote and load its current URL and name into the detail fields.
+    fn select_remote(&mut self, name: String) {
+        self.remotes.remove_armed = false;
+        if let Some(remote) = self.remotes.remotes.iter().find(|r| r.name == name) {
+            self.remotes.edit_url = remote.url.clone();
+        }
+        self.remotes.rename_to = name.clone();
+        self.remotes.selected = Some(name);
     }
 
     /// Jump to a Commit in the History view and load its detail. Used by Blame to
@@ -625,6 +681,7 @@ impl App {
             ViewMode::Branches => self.dispatch(GitCommand::LoadBranches),
             ViewMode::Stashes => self.dispatch(GitCommand::LoadStashes),
             ViewMode::Tags => self.dispatch(GitCommand::LoadTags),
+            ViewMode::Remotes => self.dispatch(GitCommand::LoadRemotes),
             ViewMode::Changes => {}
         }
     }
@@ -657,6 +714,9 @@ impl App {
         }
         if !matches!(message, GitMessage::PruneBranches) {
             self.branches.prune_armed = false;
+        }
+        if !matches!(message, GitMessage::RemoveRemote) {
+            self.remotes.remove_armed = false;
         }
         // Any git action fires on this press, so it also dismisses the menu.
         self.menu = None;
@@ -736,6 +796,38 @@ impl App {
             GitMessage::CommitAndPush => self.start_commit(true),
             GitMessage::Checkout(name) => self.dispatch(GitCommand::Checkout(name)),
             GitMessage::Merge(name) => self.dispatch(GitCommand::Merge(name)),
+            GitMessage::AddRemote => {
+                let name = self.remotes.new_name.trim().to_string();
+                let url = self.remotes.new_url.trim().to_string();
+                if !name.is_empty() && !url.is_empty() {
+                    self.dispatch(GitCommand::AddRemote { name, url });
+                }
+            }
+            GitMessage::UpdateRemoteUrl => {
+                if let Some(name) = self.remotes.selected.clone() {
+                    let url = self.remotes.edit_url.trim().to_string();
+                    if !url.is_empty() {
+                        self.dispatch(GitCommand::SetRemoteUrl { name, url });
+                    }
+                }
+            }
+            GitMessage::RenameRemote => {
+                if let Some(from) = self.remotes.selected.clone() {
+                    let to = self.remotes.rename_to.trim().to_string();
+                    if !to.is_empty() && to != from {
+                        self.dispatch(GitCommand::RenameRemote { from, to });
+                    }
+                }
+            }
+            GitMessage::RemoveRemote => {
+                // First press arms; the confirming second removes.
+                if !self.remotes.remove_armed {
+                    self.remotes.remove_armed = true;
+                } else if let Some(name) = self.remotes.selected.clone() {
+                    self.remotes.remove_armed = false;
+                    self.dispatch(GitCommand::RemoveRemote(name));
+                }
+            }
             GitMessage::CompareWithCurrent(name) => {
                 // Base is the current branch (or HEAD when detached); the diff
                 // shows what the picked branch has over it.
@@ -1027,6 +1119,36 @@ impl App {
             }
             GitEvent::BranchesLoaded(branches) => {
                 self.branches.branches = branches;
+            }
+            GitEvent::RemotesLoaded(remotes) => {
+                // Drop a selection (and its detail fields) if that remote is gone.
+                if self
+                    .remotes
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| !remotes.iter().any(|r| &r.name == s))
+                {
+                    self.remotes.selected = None;
+                    self.remotes.remove_armed = false;
+                }
+                self.remotes.remotes = remotes;
+            }
+            GitEvent::RemoteAdded(name) => {
+                self.remotes.new_name.clear();
+                self.remotes.new_url.clear();
+                self.notify(format!("Added remote {name}"));
+            }
+            GitEvent::RemoteRenamed(name) => {
+                // Follow the rename so the detail panel keeps pointing at it.
+                self.remotes.selected = Some(name.clone());
+                self.notify(format!("Renamed remote to {name}"));
+            }
+            GitEvent::RemoteUrlUpdated(name) => {
+                self.notify(format!("Updated URL of {name}"));
+            }
+            GitEvent::RemoteRemoved(name) => {
+                self.remotes.selected = None;
+                self.notify(format!("Removed remote {name}"));
             }
             GitEvent::CheckedOut(name) => {
                 self.notify(format!("Switched to {name}"));
@@ -1406,6 +1528,7 @@ fn on_key(event: KeyEvent) -> Message {
         Key::Character("3") if command => Message::Ui(UiMessage::ShowView(ViewMode::Branches)),
         Key::Character("4") if command => Message::Ui(UiMessage::ShowView(ViewMode::Stashes)),
         Key::Character("5") if command => Message::Ui(UiMessage::ShowView(ViewMode::Tags)),
+        Key::Character("6") if command => Message::Ui(UiMessage::ShowView(ViewMode::Remotes)),
         Key::Named(Named::F5) => Message::Git(GitMessage::Refresh),
         Key::Character("r") if command => Message::Git(GitMessage::Refresh),
         Key::Named(Named::Enter) if command => Message::Git(GitMessage::Commit),
@@ -2068,6 +2191,56 @@ mod tests {
         app.history.query = "   ".to_string();
         update(&mut app, Message::Ui(UiMessage::SearchHistory));
         assert!(app.history.results.is_none());
+    }
+
+    #[test]
+    fn selecting_a_remote_loads_its_fields_then_remove_arms_and_disarms() {
+        let mut app = App::new();
+        app.remotes.remotes = vec![RemoteInfo {
+            name: "origin".to_string(),
+            url: "https://example.com/r.git".to_string(),
+        }];
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::RemoteSelected("origin".to_string())),
+        );
+        assert_eq!(app.remotes.selected.as_deref(), Some("origin"));
+        assert_eq!(app.remotes.edit_url, "https://example.com/r.git");
+        assert_eq!(app.remotes.rename_to, "origin");
+
+        // First Remove press only arms the confirmation.
+        update(&mut app, Message::Git(GitMessage::RemoveRemote));
+        assert!(app.remotes.remove_armed);
+
+        // An unrelated git action cancels the pending removal.
+        update(&mut app, Message::Git(GitMessage::StageChecked));
+        assert!(!app.remotes.remove_armed);
+    }
+
+    #[test]
+    fn remote_removed_event_clears_the_selection() {
+        let mut app = App::new();
+        app.remotes.selected = Some("origin".to_string());
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::RemoteRemoved("origin".to_string())),
+        );
+        assert!(app.remotes.selected.is_none());
+    }
+
+    #[test]
+    fn adding_a_remote_clears_the_form_on_success() {
+        let mut app = App::new();
+        app.remotes.new_name = "origin".to_string();
+        app.remotes.new_url = "https://example.com/r.git".to_string();
+
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::RemoteAdded("origin".to_string())),
+        );
+        assert!(app.remotes.new_name.is_empty());
+        assert!(app.remotes.new_url.is_empty());
     }
 
     #[test]
