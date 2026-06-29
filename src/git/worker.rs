@@ -138,10 +138,20 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(detail) => events.emit(GitEvent::CommitDetailLoaded(detail)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
         },
-        GitCommand::LoadBlame(path) => match load_blame(repo, &path) {
-            Ok(file) => events.emit(GitEvent::BlameLoaded(file)),
-            Err(error) => events.emit(GitEvent::Error(error)),
-        },
+        GitCommand::LoadBlame { path, before } => {
+            match load_blame(repo, &path, before.as_deref()) {
+                Ok(file) => events.emit(GitEvent::BlameLoaded(file)),
+                Err(error) => events.emit(GitEvent::Error(error)),
+            }
+        }
+        GitCommand::LoadFileHistory(path) => {
+            match load_file_history(repo, &path, HISTORY_LIMIT) {
+                Ok(commits) => events.emit(GitEvent::SearchResults(commits)),
+                Err(error) => {
+                    events.emit(GitEvent::Error(GitError::new("file history", &error)))
+                }
+            }
+        }
         GitCommand::CompareRefs { base, target } => match compare_refs(repo, &base, &target) {
             Ok(comparison) => events.emit(GitEvent::ComparisonLoaded(comparison)),
             Err(error) => events.emit(GitEvent::Error(error)),
@@ -1756,23 +1766,39 @@ fn load_conflict(repo: &Repository, path: &str) -> Result<ConflictFile, GitError
 /// Blame a file line by line against its committed HEAD version. Each line is
 /// tagged with the Commit that last touched it (short SHA, author, time). The
 /// HEAD blob supplies the text so line numbers line up with the blame result.
-fn load_blame(repo: &Repository, path: &str) -> Result<BlameFile, GitError> {
+fn load_blame(repo: &Repository, path: &str, before: Option<&str>) -> Result<BlameFile, GitError> {
     let make = |error: &git2::Error| GitError::new("blame", error);
     let path_ref = Path::new(path);
 
-    let blame = repo.blame_file(path_ref, None).map_err(|e| make(&e))?;
+    // Pick the commit whose tree supplies the file text and bounds the blame: HEAD
+    // normally, or the parent of `before` when walking a line's history back. The
+    // blame's line numbering must match that same revision's file.
+    let mut options = git2::BlameOptions::new();
+    let text_commit = match before {
+        Some(sha) => {
+            let oid = git2::Oid::from_str(sha).map_err(|e| make(&e))?;
+            let commit = repo.find_commit(oid).map_err(|e| make(&e))?;
+            let parent = commit.parent(0).map_err(|_| {
+                GitError::custom("blame", "no earlier revision (this is the first commit)")
+            })?;
+            options.newest_commit(parent.id());
+            parent
+        }
+        None => repo
+            .head()
+            .and_then(|h| h.peel_to_commit())
+            .map_err(|e| make(&e))?,
+    };
 
-    // Read the file's text from the HEAD tree (not the working dir) so its lines
-    // match the blame's final line numbering.
-    let head = repo
-        .head()
-        .and_then(|h| h.peel_to_commit())
+    let blame = repo
+        .blame_file(path_ref, Some(&mut options))
         .map_err(|e| make(&e))?;
-    let blob = head
+
+    let blob = text_commit
         .tree()
         .and_then(|t| t.get_path(path_ref).and_then(|e| e.to_object(repo)))
         .and_then(|o| o.peel_to_blob())
-        .map_err(|e| make(&e))?;
+        .map_err(|_| GitError::custom("blame", "file does not exist at that revision"))?;
     let content = std::str::from_utf8(blob.content())
         .map_err(|_| GitError::custom("blame", "cannot blame a binary file"))?;
 
@@ -1808,7 +1834,59 @@ fn load_blame(repo: &Repository, path: &str) -> Result<BlameFile, GitError> {
     Ok(BlameFile {
         path: path.to_string(),
         lines,
+        before: before.map(str::to_string),
     })
+}
+
+/// The Commits that touched `path`, newest first, walking up to `limit`. A Commit
+/// is included when its diff against its first parent changes that exact file.
+fn load_file_history(
+    repo: &Repository,
+    path: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, git2::Error> {
+    let mut walk = repo.revwalk()?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)?;
+
+    let mut commits = Vec::new();
+    for oid in walk.take(limit) {
+        let oid = oid?;
+        let commit = repo.find_commit(oid)?;
+        if commit_changes_file(repo, &commit, path) {
+            commits.push(commit_info(repo, oid)?);
+        }
+    }
+    Ok(commits)
+}
+
+/// Whether the Commit changed the file at exactly `path`, comparing its tree to
+/// its first parent's (or the empty tree for a root Commit).
+fn commit_changes_file(repo: &Repository, commit: &git2::Commit, path: &str) -> bool {
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
+        return false;
+    };
+
+    let mut hit = false;
+    let _ = diff.foreach(
+        &mut |delta, _| {
+            let is_path = |p: Option<&Path>| p.and_then(|p| p.to_str()) == Some(path);
+            if is_path(delta.new_file().path()) || is_path(delta.old_file().path()) {
+                hit = true;
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    );
+    hit
 }
 
 /// Save hand-edited `content` for a conflicted file to the Working Tree. Returns
@@ -3661,7 +3739,14 @@ mod tests {
         // A later commit appends a third line, leaving the first two untouched.
         commit_file(dir.path(), &repo, &events, "f.txt", "one\ntwo\nthree\n");
 
-        process(&repo, GitCommand::LoadBlame("f.txt".into()), &events);
+        process(
+            &repo,
+            GitCommand::LoadBlame {
+                path: "f.txt".into(),
+                before: None,
+            },
+            &events,
+        );
         let blame = last_blame(&events);
 
         assert_eq!(blame.lines.len(), 3);
@@ -3816,12 +3901,100 @@ mod tests {
     }
 
     #[test]
+    fn file_history_lists_only_commits_touching_the_file() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "1\n");
+        commit_file(dir.path(), &repo, &events, "b.txt", "1\n");
+        commit_file(dir.path(), &repo, &events, "a.txt", "1\n2\n");
+
+        process(&repo, GitCommand::LoadFileHistory("a.txt".into()), &events);
+        let history = last_search(&events);
+
+        // Two commits touched a.txt; the b.txt-only commit is excluded.
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|c| c.summary == "add a.txt"));
+    }
+
+    #[test]
+    fn blame_before_a_commit_shows_the_earlier_version_of_a_line() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "f.txt", "original\n");
+        commit_file(dir.path(), &repo, &events, "f.txt", "changed\n");
+
+        // HEAD blame: the line belongs to the second commit.
+        process(
+            &repo,
+            GitCommand::LoadBlame {
+                path: "f.txt".into(),
+                before: None,
+            },
+            &events,
+        );
+        let head_sha = last_blame(&events).lines[0].sha.clone();
+
+        // Blame before that commit: the earlier line and a different commit.
+        process(
+            &repo,
+            GitCommand::LoadBlame {
+                path: "f.txt".into(),
+                before: Some(head_sha.clone()),
+            },
+            &events,
+        );
+        let earlier = last_blame(&events);
+        assert_eq!(earlier.lines[0].content, "original");
+        assert_ne!(earlier.lines[0].sha, head_sha);
+        assert_eq!(earlier.before.as_deref(), Some(head_sha.as_str()));
+    }
+
+    #[test]
+    fn blame_before_the_first_commit_reports_an_error() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "f.txt", "x\n");
+        process(
+            &repo,
+            GitCommand::LoadBlame {
+                path: "f.txt".into(),
+                before: None,
+            },
+            &events,
+        );
+        let sha = last_blame(&events).lines[0].sha.clone();
+
+        // There is nothing before the root commit.
+        process(
+            &repo,
+            GitCommand::LoadBlame {
+                path: "f.txt".into(),
+                before: Some(sha),
+            },
+            &events,
+        );
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::Error(_)))
+        );
+    }
+
+    #[test]
     fn blaming_a_missing_file_reports_an_error() {
         let (dir, repo) = temp_repo();
         let events = Collector::default();
         commit_file(dir.path(), &repo, &events, "f.txt", "x\n");
 
-        process(&repo, GitCommand::LoadBlame("nope.txt".into()), &events);
+        process(
+            &repo,
+            GitCommand::LoadBlame {
+                path: "nope.txt".into(),
+                before: None,
+            },
+            &events,
+        );
 
         assert!(
             events

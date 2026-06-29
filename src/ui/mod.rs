@@ -1019,30 +1019,70 @@ fn history_list(history: &HistoryState) -> Element<'_, Message> {
         .style(style::input);
     let search = container(search).padding([8, 10]);
 
-    // In search mode the matches are a flat list — the commit graph only makes
-    // sense over the full, unfiltered history.
+    // In filtered mode (search or file history) the matches are a flat list — the
+    // commit graph only makes sense over the full, unfiltered history.
     let body: Element<Message> = match &history.results {
-        Some(results) => history_results(results, history.selected.as_deref()),
+        Some(results) => {
+            history_results(results, history.selected.as_deref(), history.file.as_deref())
+        }
         None => history_graph(history),
     };
 
     column![search, body].into()
 }
 
-/// The flat list of search results, newest first, with a count header.
-fn history_results<'a>(results: &'a [CommitInfo], selected: Option<&str>) -> Element<'a, Message> {
-    if results.is_empty() {
-        return container(placeholder("No matching commits"))
+/// The flat list of filtered Commits, newest first. The header names what the
+/// filter is — a file's history (`file` set) or a text search — and offers a
+/// "Show all" escape back to the full graph.
+fn history_results<'a>(
+    results: &'a [CommitInfo],
+    selected: Option<&str>,
+    file: Option<&str>,
+) -> Element<'a, Message> {
+    let label: Element<Message> = match file {
+        Some(path) => row![
+            text("FILE").size(11).color(style::TEXT_FAINT),
+            text(path.to_string())
+                .size(11)
+                .font(Font::MONOSPACE)
+                .color(style::TEXT_MUTED),
+        ]
+        .spacing(8)
+        .into(),
+        None => branch_section_label("MATCHES", results.len()),
+    };
+    let header = row![
+        label,
+        space::horizontal(),
+        button(text("Show all").size(11))
+            .on_press(Message::Ui(UiMessage::ClearHistoryFilter))
+            .padding([2, 8])
+            .style(style::ghost),
+    ]
+    .spacing(8)
+    .align_y(Center);
+
+    let empty = if file.is_some() {
+        "No commits touch this file"
+    } else {
+        "No matching commits"
+    };
+    let list: Element<Message> = if results.is_empty() {
+        container(placeholder(empty)).height(Fill).into()
+    } else {
+        let rows: Vec<Element<Message>> = results
+            .iter()
+            .map(|c| commit_row_flat(c, selected))
+            .collect();
+        scrollable(column(rows).spacing(3))
             .height(Fill)
-            .into();
-    }
+            .width(Fill)
+            .into()
+    };
 
-    let mut items: Vec<Element<Message>> =
-        vec![branch_section_label("MATCHES", results.len())];
-    items.extend(results.iter().map(|c| commit_row_flat(c, selected)));
-
-    scrollable(column(items).spacing(3).padding(12))
-        .height(Fill)
+    column![container(header).padding([4, 4]), list]
+        .spacing(4)
+        .padding(12)
         .into()
 }
 
@@ -1919,25 +1959,51 @@ fn diff_view(repo: &RepoState) -> Element<'_, Message> {
 /// The right panel in Blame mode: every line of the file tagged with the Commit
 /// that last touched it (short SHA, author, date), with a "Diff" escape back.
 fn blame_view(file: &BlameFile) -> Element<'_, Message> {
-    let header = container(
-        row![
-            text("Blame").size(11).color(style::INFO),
-            text(file.path.clone())
-                .size(13)
-                .font(Font::MONOSPACE)
-                .color(style::TEXT),
-            space::horizontal(),
-            button(text("Diff").size(11))
-                .on_press(Message::Ui(UiMessage::HideBlame))
+    let mut bar = row![
+        text("Blame").size(11).color(style::INFO),
+        text(file.path.clone())
+            .size(13)
+            .font(Font::MONOSPACE)
+            .color(style::TEXT),
+    ]
+    .spacing(12)
+    .align_y(Center);
+
+    // When walking history backwards, show which commit we are blaming "before"
+    // and offer a reset back to the HEAD blame.
+    if let Some(before) = &file.before {
+        let short: String = before.chars().take(7).collect();
+        bar = bar.push(
+            text(format!("before {short}"))
+                .size(11)
+                .color(style::YELLOW),
+        );
+        bar = bar.push(
+            button(text("Reset").size(11))
+                .on_press(Message::Ui(UiMessage::ResetBlame))
                 .padding([3, 9])
                 .style(style::ghost),
-        ]
-        .spacing(12)
-        .align_y(Center),
-    )
-    .style(style::diff_header)
-    .padding([7, 12])
-    .width(Fill);
+        );
+    }
+
+    bar = bar.push(space::horizontal());
+    bar = bar.push(
+        button(text("History").size(11))
+            .on_press(Message::Ui(UiMessage::ShowFileHistory(file.path.clone())))
+            .padding([3, 9])
+            .style(style::ghost),
+    );
+    bar = bar.push(
+        button(text("Diff").size(11))
+            .on_press(Message::Ui(UiMessage::HideBlame))
+            .padding([3, 9])
+            .style(style::ghost),
+    );
+
+    let header = container(bar)
+        .style(style::diff_header)
+        .padding([7, 12])
+        .width(Fill);
 
     let lang = highlight::lang_for(&file.path);
     let rows: Vec<Element<Message>> = file
@@ -1961,16 +2027,25 @@ fn blame_line<'a>(
     line: &'a crate::git::BlameLine,
     lang: highlight::Lang,
 ) -> Element<'a, Message> {
-    // The short SHA links to the Commit in History; a boundary line (no
-    // attribution) gets a blank placeholder so the columns stay aligned.
-    let sha_link: Element<Message> = if line.sha.is_empty() {
-        text("       ").font(Font::MONOSPACE).size(11).into()
+    // The short SHA links to the Commit in History, and the "⮜" re-blames before
+    // it (walking the line's history back). A boundary line (no attribution) gets
+    // blank placeholders so the columns stay aligned.
+    let (sha_link, before_link): (Element<Message>, Element<Message>) = if line.sha.is_empty() {
+        (
+            text("       ").font(Font::MONOSPACE).size(11).into(),
+            text(" ").size(11).into(),
+        )
     } else {
         let short: String = line.sha.chars().take(7).collect();
-        mouse_area(text(short).font(Font::MONOSPACE).size(11).color(style::INFO))
+        let sha = mouse_area(text(short).font(Font::MONOSPACE).size(11).color(style::INFO))
             .on_press(Message::Ui(UiMessage::ShowCommit(line.sha.clone())))
             .interaction(iced::mouse::Interaction::Pointer)
-            .into()
+            .into();
+        let before = mouse_area(text("⮜").size(11).color(style::TEXT_FAINT))
+            .on_press(Message::Ui(UiMessage::ReblameBefore(line.sha.clone())))
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into();
+        (sha, before)
     };
 
     let meta = format!("{:>10.10} {}", line.author, ymd(line.time));
@@ -1983,6 +2058,7 @@ fn blame_line<'a>(
     container(
         row![
             sha_link,
+            before_link,
             text(meta)
                 .font(Font::MONOSPACE)
                 .size(11)
@@ -1993,7 +2069,7 @@ fn blame_line<'a>(
                 .color(style::TEXT_FAINT),
             rich_text(spans).font(Font::MONOSPACE).size(13),
         ]
-        .spacing(12)
+        .spacing(10)
         .align_y(Center),
     )
     .width(Fill)
@@ -2083,6 +2159,10 @@ fn diff_header(diff: &Diff) -> Element<'_, Message> {
             text(format!("−{removed}")).size(12).color(style::RED),
             button(text("Blame").size(11))
                 .on_press(Message::Ui(UiMessage::ShowBlame))
+                .padding([3, 9])
+                .style(style::ghost),
+            button(text("History").size(11))
+                .on_press(Message::Ui(UiMessage::ShowFileHistory(diff.path.clone())))
                 .padding([3, 9])
                 .style(style::ghost),
         ]

@@ -116,9 +116,12 @@ pub struct HistoryState {
     pub detail: Option<CommitDetail>,
     /// The history search box's current text.
     pub query: String,
-    /// The matches for the last submitted search; `None` when not searching (the
-    /// full `commits` graph is shown instead).
+    /// The matches for the last submitted search, or a file's history; `None` when
+    /// neither (the full `commits` graph is shown instead).
     pub results: Option<Vec<CommitInfo>>,
+    /// When the `results` list is a file's history, the file path (for the header);
+    /// `None` when `results` is a text search.
+    pub file: Option<String>,
 }
 
 /// The Branches view's state: the loaded branches, the in-progress new-branch
@@ -323,6 +326,16 @@ pub enum UiMessage {
     ShowBlame,
     /// Return from Blame to the file's Diff.
     HideBlame,
+    /// Re-run the Blame as of the parent of the given Commit ("blame before this
+    /// commit"), to walk a line's history backwards.
+    ReblameBefore(String),
+    /// Return the Blame to the file's HEAD version (undo "blame before").
+    ResetBlame,
+    /// Show the history of a file (the Commits that touched it) in the History
+    /// view.
+    ShowFileHistory(String),
+    /// Leave a filtered history (search or file) and show the full graph again.
+    ClearHistoryFilter,
     /// Jump to a Commit in the History view (e.g. from a Blame line), loading its
     /// detail even when it sits outside the loaded history window.
     ShowCommit(String),
@@ -493,6 +506,8 @@ impl App {
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
             UiMessage::HistoryQueryChanged(query) => {
                 self.history.query = query;
+                // Typing in the box is a text search, not a file history.
+                self.history.file = None;
                 // Emptying the box leaves search mode and restores the full graph.
                 if self.history.query.trim().is_empty() {
                     self.history.results = None;
@@ -500,6 +515,7 @@ impl App {
             }
             UiMessage::SearchHistory => {
                 let query = self.history.query.trim().to_string();
+                self.history.file = None;
                 if query.is_empty() {
                     self.history.results = None;
                 } else {
@@ -527,10 +543,42 @@ impl App {
             UiMessage::ShowBlame => {
                 if let Some(selection) = &self.repo.selected {
                     self.repo.blame = None;
-                    self.dispatch(GitCommand::LoadBlame(selection.path.clone()));
+                    self.dispatch(GitCommand::LoadBlame {
+                        path: selection.path.clone(),
+                        before: None,
+                    });
                 }
             }
             UiMessage::HideBlame => self.repo.blame = None,
+            UiMessage::ReblameBefore(sha) => {
+                // The file being blamed is the one in the current blame view.
+                if let Some(blame) = &self.repo.blame {
+                    self.dispatch(GitCommand::LoadBlame {
+                        path: blame.path.clone(),
+                        before: Some(sha),
+                    });
+                }
+            }
+            UiMessage::ResetBlame => {
+                if let Some(blame) = &self.repo.blame {
+                    self.dispatch(GitCommand::LoadBlame {
+                        path: blame.path.clone(),
+                        before: None,
+                    });
+                }
+            }
+            UiMessage::ShowFileHistory(path) => {
+                self.view = ViewMode::History;
+                self.history.query.clear();
+                self.history.file = Some(path.clone());
+                self.history.results = None;
+                self.dispatch(GitCommand::LoadFileHistory(path));
+            }
+            UiMessage::ClearHistoryFilter => {
+                self.history.query.clear();
+                self.history.file = None;
+                self.history.results = None;
+            }
             UiMessage::ShowCommit(sha) => self.navigate_to_commit(sha),
             UiMessage::CloseComparison => self.branches.comparison = None,
         }
@@ -1877,6 +1925,7 @@ mod tests {
                 time: 1_700_000_000,
                 content: "x".to_string(),
             }],
+            before: None,
         };
 
         // Blame for the selected file is stored…
@@ -1899,6 +1948,7 @@ mod tests {
         let blame = crate::git::BlameFile {
             path: "other.txt".to_string(),
             lines: vec![],
+            before: None,
         };
         update(&mut app, Message::GitEvent(GitEvent::BlameLoaded(blame)));
         assert!(app.repo.blame.is_none());
@@ -1915,6 +1965,7 @@ mod tests {
         app.repo.blame = Some(crate::git::BlameFile {
             path: "a.txt".to_string(),
             lines: vec![],
+            before: None,
         });
 
         update(
@@ -1972,6 +2023,43 @@ mod tests {
             Message::Ui(UiMessage::HistoryQueryChanged(String::new())),
         );
         assert!(app.history.results.is_none());
+    }
+
+    #[test]
+    fn showing_file_history_switches_view_sets_the_file_then_clears() {
+        let mut app = App::new();
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ShowFileHistory("src/app.rs".to_string())),
+        );
+        assert_eq!(app.view, ViewMode::History);
+        assert_eq!(app.history.file.as_deref(), Some("src/app.rs"));
+
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::SearchResults(vec![commit_info("abc")])),
+        );
+        assert!(app.history.results.is_some());
+
+        // "Show all" leaves the file history for the full graph.
+        update(&mut app, Message::Ui(UiMessage::ClearHistoryFilter));
+        assert!(app.history.results.is_none());
+        assert!(app.history.file.is_none());
+    }
+
+    #[test]
+    fn searching_clears_an_active_file_history() {
+        let mut app = App::new();
+        app.history.file = Some("src/app.rs".to_string());
+        app.history.results = Some(vec![commit_info("abc")]);
+
+        // Typing in the search box turns it into a text search, not a file view.
+        update(
+            &mut app,
+            Message::Ui(UiMessage::HistoryQueryChanged("fix".to_string())),
+        );
+        assert!(app.history.file.is_none());
     }
 
     #[test]

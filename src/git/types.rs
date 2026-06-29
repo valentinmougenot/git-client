@@ -45,8 +45,15 @@ pub enum GitCommand {
     SearchHistory(String),
     /// Load one Commit's metadata and full Diff (against its first parent).
     LoadCommitDetail(String),
-    /// Load the line-by-line blame for a file (its committed HEAD version).
-    LoadBlame(String),
+    /// Load the line-by-line blame for a file. With `before` set to a Commit SHA,
+    /// blame the file as of that Commit's parent ("blame before this commit"), to
+    /// walk a line's history backwards; otherwise blame the HEAD version.
+    LoadBlame {
+        path: String,
+        before: Option<String>,
+    },
+    /// Load the Commits that touched a file, newest first (a file's history).
+    LoadFileHistory(String),
     /// Compare two refs (branches, tags, or SHAs): the diff from `base` to
     /// `target`, i.e. what `target` has that `base` does not.
     CompareRefs { base: String, target: String },
@@ -218,6 +225,9 @@ pub struct Comparison {
 pub struct BlameFile {
     pub path: String,
     pub lines: Vec<BlameLine>,
+    /// The Commit SHA this blame is "before", when walking history backwards
+    /// (the file is blamed as of this Commit's parent). `None` for a HEAD blame.
+    pub before: Option<String>,
 }
 
 /// One blamed line: the Commit that last touched it, plus the line's content.
