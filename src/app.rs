@@ -311,6 +311,9 @@ pub enum UiMessage {
     ShowBlame,
     /// Return from Blame to the file's Diff.
     HideBlame,
+    /// Jump to a Commit in the History view (e.g. from a Blame line), loading its
+    /// detail even when it sits outside the loaded history window.
+    ShowCommit(String),
 }
 
 #[derive(Debug, Clone)]
@@ -497,7 +500,23 @@ impl App {
                 }
             }
             UiMessage::HideBlame => self.repo.blame = None,
+            UiMessage::ShowCommit(sha) => self.navigate_to_commit(sha),
         }
+    }
+
+    /// Jump to a Commit in the History view and load its detail. Used by Blame to
+    /// reach the Commit behind a line — which may sit outside the loaded history
+    /// window, so the detail is requested first (it arrives before the list
+    /// reload) and the reconcile keeps the selection while a detail backs it.
+    fn navigate_to_commit(&mut self, sha: String) {
+        if sha.is_empty() {
+            return;
+        }
+        self.view = ViewMode::History;
+        self.history.selected = Some(sha.clone());
+        self.history.detail = None;
+        self.dispatch(GitCommand::LoadCommitDetail(sha));
+        self.dispatch(GitCommand::LoadHistory);
     }
 
     /// Open the manual editor for the selected conflicted file, seeding the buffer
@@ -1148,14 +1167,16 @@ impl App {
     }
 
     /// Drop the Commit selection and its detail if that Commit is no longer in
-    /// the loaded history (e.g. after an amend or a rebase elsewhere).
+    /// the loaded history (e.g. after an amend or a rebase elsewhere). A selection
+    /// reached via Blame may sit outside the loaded window, so a loaded detail for
+    /// it also counts as valid — it is the commit the user is actually inspecting.
     fn reconcile_commit_selection(&mut self) {
-        let still_present = self
-            .history
-            .selected
-            .as_ref()
-            .is_some_and(|sha| self.history.commits.iter().any(|c| &c.sha == sha));
-        if self.history.selected.is_some() && !still_present {
+        let Some(sha) = self.history.selected.clone() else {
+            return;
+        };
+        let in_list = self.history.commits.iter().any(|c| c.sha == sha);
+        let has_detail = self.history.detail.as_ref().is_some_and(|d| d.sha == sha);
+        if !in_list && !has_detail {
             self.history.selected = None;
             self.history.detail = None;
         }
@@ -1795,7 +1816,7 @@ mod tests {
         let blame = crate::git::BlameFile {
             path: "a.txt".to_string(),
             lines: vec![crate::git::BlameLine {
-                short_sha: "abc1234".to_string(),
+                sha: "abc1234".to_string(),
                 author: "Tester".to_string(),
                 time: 1_700_000_000,
                 content: "x".to_string(),
@@ -1848,6 +1869,88 @@ mod tests {
             }),
         );
         assert!(app.repo.blame.is_none());
+    }
+
+    fn commit_info(sha: &str) -> crate::git::CommitInfo {
+        crate::git::CommitInfo {
+            sha: sha.to_string(),
+            short_sha: sha.chars().take(7).collect(),
+            summary: "summary".to_string(),
+            author: "Tester".to_string(),
+            time: 0,
+            parents: vec![],
+        }
+    }
+
+    fn commit_detail(sha: &str) -> crate::git::CommitDetail {
+        crate::git::CommitDetail {
+            sha: sha.to_string(),
+            short_sha: sha.chars().take(7).collect(),
+            author: "Tester".to_string(),
+            email: "t@e".to_string(),
+            time: 0,
+            message: "message".to_string(),
+            lines: vec![],
+        }
+    }
+
+    #[test]
+    fn navigating_from_blame_switches_to_history_and_selects_the_commit() {
+        let mut app = App::new();
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ShowCommit("abc123full".to_string())),
+        );
+
+        assert_eq!(app.view, ViewMode::History);
+        assert_eq!(app.history.selected.as_deref(), Some("abc123full"));
+    }
+
+    #[test]
+    fn an_empty_blame_sha_does_not_navigate() {
+        let mut app = App::new();
+        update(&mut app, Message::Ui(UiMessage::ShowCommit(String::new())));
+        assert_eq!(app.view, ViewMode::Changes);
+        assert!(app.history.selected.is_none());
+    }
+
+    #[test]
+    fn a_blamed_commit_outside_the_window_survives_a_history_reload() {
+        let mut app = App::new();
+        update(
+            &mut app,
+            Message::Ui(UiMessage::ShowCommit("oldsha".to_string())),
+        );
+
+        // Its detail arrives (the navigated commit is what the user inspects).
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::CommitDetailLoaded(commit_detail("oldsha"))),
+        );
+        assert!(app.history.detail.is_some());
+
+        // The history list reloads but does not contain that commit; the loaded
+        // detail keeps the selection alive rather than snapping to the newest.
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::HistoryLoaded(vec![commit_info("recent")])),
+        );
+        assert_eq!(app.history.selected.as_deref(), Some("oldsha"));
+        assert!(app.history.detail.is_some());
+    }
+
+    #[test]
+    fn a_vanished_commit_with_no_detail_is_cleared_on_reload() {
+        let mut app = App::new();
+        app.history.selected = Some("gone".to_string());
+
+        // A reload without that commit and with no backing detail drops it.
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::HistoryLoaded(vec![commit_info("recent")])),
+        );
+        assert_eq!(app.history.selected.as_deref(), Some("recent"));
     }
 
     #[test]

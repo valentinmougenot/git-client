@@ -203,8 +203,10 @@ pub struct BlameFile {
 /// One blamed line: the Commit that last touched it, plus the line's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlameLine {
-    /// Short SHA of the Commit that introduced this line's current form.
-    pub short_sha: String,
+    /// Full SHA of the Commit that introduced this line's current form (empty for
+    /// a boundary line with no attribution). Full so the UI can navigate to it;
+    /// the short form is derived for display.
+    pub sha: String,
     /// That Commit's author name.
     pub author: String,
     /// That Commit's author time, Unix seconds.

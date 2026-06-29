@@ -1817,14 +1817,26 @@ fn blame_view(file: &BlameFile) -> Element<'_, Message> {
 }
 
 /// One blamed line: a gutter (short SHA, author, date, line number) then the
-/// syntax-highlighted content. Lines sharing a Commit with the line above hide
-/// the repeated attribution, so blocks from one Commit read as a group.
+/// syntax-highlighted content. The short SHA is a link that jumps to its Commit
+/// in the History view.
 fn blame_line<'a>(
     lineno: usize,
     line: &'a crate::git::BlameLine,
     lang: highlight::Lang,
 ) -> Element<'a, Message> {
-    let attribution = format!("{:7} {:>10.10} {}", line.short_sha, line.author, ymd(line.time));
+    // The short SHA links to the Commit in History; a boundary line (no
+    // attribution) gets a blank placeholder so the columns stay aligned.
+    let sha_link: Element<Message> = if line.sha.is_empty() {
+        text("       ").font(Font::MONOSPACE).size(11).into()
+    } else {
+        let short: String = line.sha.chars().take(7).collect();
+        mouse_area(text(short).font(Font::MONOSPACE).size(11).color(style::INFO))
+            .on_press(Message::Ui(UiMessage::ShowCommit(line.sha.clone())))
+            .interaction(iced::mouse::Interaction::Pointer)
+            .into()
+    };
+
+    let meta = format!("{:>10.10} {}", line.author, ymd(line.time));
 
     let mut spans: Vec<iced::widget::text::Span<()>> = Vec::new();
     for (fragment, color) in highlight::spans(&line.content, lang) {
@@ -1833,7 +1845,8 @@ fn blame_line<'a>(
 
     container(
         row![
-            text(attribution)
+            sha_link,
+            text(meta)
                 .font(Font::MONOSPACE)
                 .size(11)
                 .color(style::TEXT_FAINT),

@@ -1678,10 +1678,9 @@ fn load_blame(repo: &Repository, path: &str) -> Result<BlameFile, GitError> {
         .map(|(i, text)| {
             // get_line is 1-based; fall back to empty attribution if absent.
             let hunk = blame.get_line(i + 1);
-            let (short_sha, author, time) = match hunk {
+            let (sha, author, time) = match hunk {
                 Some(hunk) => {
-                    let oid = hunk.final_commit_id();
-                    let short_sha = oid.to_string()[..7].to_string();
+                    let sha = hunk.final_commit_id().to_string();
                     let sig = hunk.final_signature();
                     let author = sig
                         .as_ref()
@@ -1689,12 +1688,12 @@ fn load_blame(repo: &Repository, path: &str) -> Result<BlameFile, GitError> {
                         .unwrap_or("unknown")
                         .to_string();
                     let time = sig.as_ref().map(|s| s.when().seconds()).unwrap_or(0);
-                    (short_sha, author, time)
+                    (sha, author, time)
                 }
                 None => (String::new(), String::new(), 0),
             };
             BlameLine {
-                short_sha,
+                sha,
                 author,
                 time,
                 content: text.to_string(),
@@ -3565,7 +3564,8 @@ mod tests {
         assert_eq!(blame.lines[0].content, "one");
         assert_eq!(blame.lines[2].content, "three");
         // The appended line is attributed to a different (later) commit.
-        assert_ne!(blame.lines[0].short_sha, blame.lines[2].short_sha);
+        assert_ne!(blame.lines[0].sha, blame.lines[2].sha);
+        assert_eq!(blame.lines[0].sha.len(), 40);
         assert!(blame.lines.iter().all(|l| l.author == "Tester"));
         assert!(blame.lines.iter().all(|l| l.time > 0));
     }
