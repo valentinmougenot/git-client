@@ -1011,6 +1011,43 @@ const LANE_W: f32 = 16.0;
 /// The left column in the History view: the recent Commits as a graph, newest
 /// first. The graph lanes are laid out once, then each row draws its own cell.
 fn history_list(history: &HistoryState) -> Element<'_, Message> {
+    let search = text_input("Search message, author, file…", &history.query)
+        .on_input(|value| Message::Ui(UiMessage::HistoryQueryChanged(value)))
+        .on_submit(Message::Ui(UiMessage::SearchHistory))
+        .padding([7, 10])
+        .size(13)
+        .style(style::input);
+    let search = container(search).padding([8, 10]);
+
+    // In search mode the matches are a flat list — the commit graph only makes
+    // sense over the full, unfiltered history.
+    let body: Element<Message> = match &history.results {
+        Some(results) => history_results(results, history.selected.as_deref()),
+        None => history_graph(history),
+    };
+
+    column![search, body].into()
+}
+
+/// The flat list of search results, newest first, with a count header.
+fn history_results<'a>(results: &'a [CommitInfo], selected: Option<&str>) -> Element<'a, Message> {
+    if results.is_empty() {
+        return container(placeholder("No matching commits"))
+            .height(Fill)
+            .into();
+    }
+
+    let mut items: Vec<Element<Message>> =
+        vec![branch_section_label("MATCHES", results.len())];
+    items.extend(results.iter().map(|c| commit_row_flat(c, selected)));
+
+    scrollable(column(items).spacing(3).padding(12))
+        .height(Fill)
+        .into()
+}
+
+/// The full history as a commit graph, newest first.
+fn history_graph(history: &HistoryState) -> Element<'_, Message> {
     if history.commits.is_empty() {
         return container(placeholder("No commits yet")).height(Fill).into();
     }
@@ -1077,6 +1114,40 @@ fn commit_row<'a>(
     let row = container(row![cell, body].spacing(6).align_y(Center))
         .height(Length::Fixed(COMMIT_ROW_H));
     mouse_area(row)
+        .on_right_press(Message::Ui(UiMessage::OpenMenu(MenuTarget::Commit {
+            sha: commit.sha.clone(),
+            short_sha: commit.short_sha.clone(),
+        })))
+        .into()
+}
+
+/// One search-result Commit: like [`commit_row`] but with no graph cell (a
+/// filtered subset has no meaningful graph). Same selection and context menu.
+fn commit_row_flat<'a>(commit: &CommitInfo, selected: Option<&str>) -> Element<'a, Message> {
+    let active = selected == Some(commit.sha.as_str());
+
+    let meta = format!("{} · {}", commit.author, relative_time(commit.time));
+    let body = column![
+        row![
+            text(commit.short_sha.clone())
+                .size(12)
+                .font(Font::MONOSPACE)
+                .color(style::INFO),
+            text(commit.summary.clone()).size(13).color(style::TEXT),
+        ]
+        .spacing(10)
+        .align_y(Center),
+        text(meta).size(11).color(style::TEXT_FAINT),
+    ]
+    .spacing(2);
+
+    let body = button(body)
+        .on_press(Message::Ui(UiMessage::CommitSelected(commit.sha.clone())))
+        .width(Fill)
+        .padding([7, 8])
+        .style(style::file_item(active));
+
+    mouse_area(body)
         .on_right_press(Message::Ui(UiMessage::OpenMenu(MenuTarget::Commit {
             sha: commit.sha.clone(),
             short_sha: commit.short_sha.clone(),

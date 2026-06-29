@@ -40,6 +40,9 @@ pub enum GitCommand {
     Amend(String),
     /// Load the most recent Commits on the current branch, newest first.
     LoadHistory,
+    /// Search recent Commits for a query (case-insensitive), matching the message,
+    /// author, SHA, or a touched file path.
+    SearchHistory(String),
     /// Load one Commit's metadata and full Diff (against its first parent).
     LoadCommitDetail(String),
     /// Load the line-by-line blame for a file (its committed HEAD version).
@@ -144,6 +147,8 @@ pub enum GitEvent {
     Committed(String),
     /// The recent Commit history, newest first.
     HistoryLoaded(Vec<CommitInfo>),
+    /// The Commits matching a history search, newest first.
+    SearchResults(Vec<CommitInfo>),
     /// One Commit's metadata and full Diff.
     CommitDetailLoaded(CommitDetail),
     /// A reset completed; carries the short SHA the branch now points at.

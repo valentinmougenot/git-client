@@ -130,6 +130,10 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(commits) => events.emit(GitEvent::HistoryLoaded(commits)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load history", &error))),
         },
+        GitCommand::SearchHistory(query) => match search_history(repo, &query, HISTORY_LIMIT) {
+            Ok(commits) => events.emit(GitEvent::SearchResults(commits)),
+            Err(error) => events.emit(GitEvent::Error(GitError::new("search history", &error))),
+        },
         GitCommand::LoadCommitDetail(sha) => match load_commit_detail(repo, &sha) {
             Ok(detail) => events.emit(GitEvent::CommitDetailLoaded(detail)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
@@ -858,17 +862,88 @@ fn load_history(repo: &Repository, limit: usize) -> Result<Vec<CommitInfo>, git2
     let mut commits = Vec::new();
     for oid in walk.take(limit) {
         let oid = oid?;
-        let commit = repo.find_commit(oid)?;
-        commits.push(CommitInfo {
-            short_sha: short_sha(oid),
-            sha: oid.to_string(),
-            summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
-            author: commit.author().name().unwrap_or_default().to_string(),
-            time: commit.time().seconds(),
-            parents: commit.parent_ids().map(|id| id.to_string()).collect(),
-        });
+        commits.push(commit_info(repo, oid)?);
     }
     Ok(commits)
+}
+
+/// Build a [`CommitInfo`] row for one Commit.
+fn commit_info(repo: &Repository, oid: git2::Oid) -> Result<CommitInfo, git2::Error> {
+    let commit = repo.find_commit(oid)?;
+    Ok(CommitInfo {
+        short_sha: short_sha(oid),
+        sha: oid.to_string(),
+        summary: commit.summary().ok().flatten().unwrap_or_default().to_string(),
+        author: commit.author().name().unwrap_or_default().to_string(),
+        time: commit.time().seconds(),
+        parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+    })
+}
+
+/// Search the Commit history (up to `limit` walked) for `query`, case-insensitive.
+/// A Commit matches when the query is a substring of its full message, author
+/// name or email, SHA, or any file path it changed. The cheap fields are tested
+/// first; the (costlier) changed-file scan only runs when they miss.
+fn search_history(
+    repo: &Repository,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, git2::Error> {
+    let needle = query.to_lowercase();
+    let mut walk = repo.revwalk()?;
+    if walk.push_head().is_err() {
+        return Ok(Vec::new());
+    }
+    walk.set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)?;
+
+    let mut matches = Vec::new();
+    for oid in walk.take(limit) {
+        let oid = oid?;
+        let commit = repo.find_commit(oid)?;
+        let author = commit.author();
+
+        let in_text =
+            |s: Result<&str, git2::Error>| s.is_ok_and(|s| s.to_lowercase().contains(&needle));
+        let cheap = oid.to_string().contains(&needle)
+            || in_text(commit.message())
+            || in_text(author.name())
+            || in_text(author.email());
+
+        if cheap || commit_touches_path(repo, &commit, &needle) {
+            matches.push(commit_info(repo, oid)?);
+        }
+    }
+    Ok(matches)
+}
+
+/// Whether the Commit changed any file whose path contains `needle` (lowercased),
+/// diffing it against its first parent (or the empty tree for a root Commit).
+fn commit_touches_path(repo: &Repository, commit: &git2::Commit, needle: &str) -> bool {
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
+        return false;
+    };
+
+    let mut hit = false;
+    let _ = diff.foreach(
+        &mut |delta, _| {
+            let path_matches = |p: Option<&Path>| {
+                p.and_then(|p| p.to_str())
+                    .is_some_and(|p| p.to_lowercase().contains(needle))
+            };
+            if path_matches(delta.new_file().path()) || path_matches(delta.old_file().path()) {
+                hit = true;
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    );
+    hit
 }
 
 /// Load one Commit's metadata and its full Diff against its first parent (or
@@ -3597,6 +3672,64 @@ mod tests {
         assert_eq!(blame.lines[0].sha.len(), 40);
         assert!(blame.lines.iter().all(|l| l.author == "Tester"));
         assert!(blame.lines.iter().all(|l| l.time > 0));
+    }
+
+    /// The most recent `SearchResults` payload.
+    fn last_search(events: &Collector) -> Vec<CommitInfo> {
+        events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::SearchResults(commits) => Some(commits),
+                _ => None,
+            })
+            .expect("expected a SearchResults event")
+    }
+
+    #[test]
+    fn search_history_matches_message_author_and_finds_nothing_for_misses() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "alpha.txt", "x\n");
+        commit_file(dir.path(), &repo, &events, "beta.txt", "y\n");
+
+        // "alpha" hits one commit (its message "add alpha.txt").
+        process(&repo, GitCommand::SearchHistory("alpha".into()), &events);
+        let one = last_search(&events);
+        assert_eq!(one.len(), 1);
+        assert!(one[0].summary.contains("alpha"));
+
+        // The author "Tester" is on every commit (case-insensitive).
+        process(&repo, GitCommand::SearchHistory("tester".into()), &events);
+        assert_eq!(last_search(&events).len(), 2);
+
+        // A miss yields no results.
+        process(&repo, GitCommand::SearchHistory("zzzz".into()), &events);
+        assert!(last_search(&events).is_empty());
+    }
+
+    #[test]
+    fn search_history_matches_a_changed_file_path_even_when_the_message_does_not() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        write(dir.path(), "secret_config.txt", "data\n");
+        process(
+            &repo,
+            GitCommand::StageFile("secret_config.txt".into()),
+            &events,
+        );
+        process(&repo, GitCommand::Commit("unrelated message".into()), &events);
+
+        process(
+            &repo,
+            GitCommand::SearchHistory("secret_config".into()),
+            &events,
+        );
+        let results = last_search(&events);
+        assert_eq!(results.len(), 1);
+        // The match came from the file path, not the (unrelated) commit message.
+        assert!(!results[0].summary.contains("secret_config"));
     }
 
     /// The most recent `ComparisonLoaded` payload.

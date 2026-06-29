@@ -114,6 +114,11 @@ pub struct HistoryState {
     /// The SHA of the selected Commit, whose detail is shown.
     pub selected: Option<String>,
     pub detail: Option<CommitDetail>,
+    /// The history search box's current text.
+    pub query: String,
+    /// The matches for the last submitted search; `None` when not searching (the
+    /// full `commits` graph is shown instead).
+    pub results: Option<Vec<CommitInfo>>,
 }
 
 /// The Branches view's state: the loaded branches, the in-progress new-branch
@@ -289,6 +294,10 @@ pub enum UiMessage {
     ShowView(ViewMode),
     /// Select a Commit in the History view and load its detail.
     CommitSelected(String),
+    /// The history search box text changed. Clearing it leaves search mode.
+    HistoryQueryChanged(String),
+    /// Run the history search for the current query (submitted with Enter).
+    SearchHistory,
     /// Open a right-click context menu for the given target (at the cursor).
     OpenMenu(MenuTarget),
     /// Arm the open menu's destructive action (its confirming first press).
@@ -482,6 +491,21 @@ impl App {
             UiMessage::SelectPrevious => self.move_selection(-1),
             UiMessage::ShowView(view) => self.show_view(view),
             UiMessage::CommitSelected(sha) => self.select_commit(sha),
+            UiMessage::HistoryQueryChanged(query) => {
+                self.history.query = query;
+                // Emptying the box leaves search mode and restores the full graph.
+                if self.history.query.trim().is_empty() {
+                    self.history.results = None;
+                }
+            }
+            UiMessage::SearchHistory => {
+                let query = self.history.query.trim().to_string();
+                if query.is_empty() {
+                    self.history.results = None;
+                } else {
+                    self.dispatch(GitCommand::SearchHistory(query));
+                }
+            }
             UiMessage::OpenMenu(target) => self.open_menu(target),
             UiMessage::ArmMenu => {
                 if let Some(menu) = &mut self.menu {
@@ -889,6 +913,15 @@ impl App {
                 {
                     self.select_commit(first.sha.clone());
                 }
+            }
+            GitEvent::SearchResults(commits) => {
+                // Keep the search results separate from the full history so a
+                // later refresh of the graph doesn't clobber them. Selecting the
+                // first match keeps the detail panel meaningful.
+                if let Some(first) = commits.first() {
+                    self.select_commit(first.sha.clone());
+                }
+                self.history.results = Some(commits);
             }
             GitEvent::CommitDetailLoaded(detail) => {
                 // Ignore a detail that no longer matches the selection (the user
@@ -1915,6 +1948,38 @@ mod tests {
             message: "message".to_string(),
             lines: vec![],
         }
+    }
+
+    #[test]
+    fn search_results_populate_then_clearing_the_query_exits_search() {
+        let mut app = App::new();
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::HistoryQueryChanged("fix".to_string())),
+        );
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::SearchResults(vec![commit_info("abcd123")])),
+        );
+        assert!(app.history.results.is_some());
+        // The first match becomes the selected commit so the detail panel fills.
+        assert_eq!(app.history.selected.as_deref(), Some("abcd123"));
+
+        // Emptying the search box returns to the full-history graph.
+        update(
+            &mut app,
+            Message::Ui(UiMessage::HistoryQueryChanged(String::new())),
+        );
+        assert!(app.history.results.is_none());
+    }
+
+    #[test]
+    fn submitting_an_empty_search_does_not_enter_search_mode() {
+        let mut app = App::new();
+        app.history.query = "   ".to_string();
+        update(&mut app, Message::Ui(UiMessage::SearchHistory));
+        assert!(app.history.results.is_none());
     }
 
     #[test]
