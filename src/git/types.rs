@@ -42,6 +42,8 @@ pub enum GitCommand {
     LoadHistory,
     /// Load one Commit's metadata and full Diff (against its first parent).
     LoadCommitDetail(String),
+    /// Load the line-by-line blame for a file (its committed HEAD version).
+    LoadBlame(String),
     /// Move the current branch to the given Commit, with the chosen reset mode
     /// (soft keeps the index and Working Tree; mixed resets the index; hard
     /// resets both, discarding uncommitted changes).
@@ -184,8 +186,31 @@ pub enum GitEvent {
     },
     /// A conflicted file parsed into its regions, for region-by-region resolution.
     ConflictLoaded(ConflictFile),
+    /// A file's line-by-line blame.
+    BlameLoaded(BlameFile),
     /// Any operation failed.
     Error(GitError),
+}
+
+/// A file blamed line by line: each line tagged with the Commit that last touched
+/// it. Lines are in file order; the line number is the 1-based index plus one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameFile {
+    pub path: String,
+    pub lines: Vec<BlameLine>,
+}
+
+/// One blamed line: the Commit that last touched it, plus the line's content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameLine {
+    /// Short SHA of the Commit that introduced this line's current form.
+    pub short_sha: String,
+    /// That Commit's author name.
+    pub author: String,
+    /// That Commit's author time, Unix seconds.
+    pub time: i64,
+    /// The line's text (no trailing newline).
+    pub content: String,
 }
 
 /// A conflicted file's Working Tree content, split into ordered segments so the

@@ -134,6 +134,10 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(detail) => events.emit(GitEvent::CommitDetailLoaded(detail)),
             Err(error) => events.emit(GitEvent::Error(GitError::new("load commit", &error))),
         },
+        GitCommand::LoadBlame(path) => match load_blame(repo, &path) {
+            Ok(file) => events.emit(GitEvent::BlameLoaded(file)),
+            Err(error) => events.emit(GitEvent::Error(error)),
+        },
         GitCommand::Reset { sha, kind } => {
             match reset_to(repo, &sha, kind) {
                 Ok(short) => events.emit(GitEvent::ResetDone(short)),
@@ -1642,6 +1646,65 @@ fn load_conflict(repo: &Repository, path: &str) -> Result<ConflictFile, GitError
         path: path.to_string(),
         segments: parse_conflict(&content),
         raw: content,
+    })
+}
+
+/// Blame a file line by line against its committed HEAD version. Each line is
+/// tagged with the Commit that last touched it (short SHA, author, time). The
+/// HEAD blob supplies the text so line numbers line up with the blame result.
+fn load_blame(repo: &Repository, path: &str) -> Result<BlameFile, GitError> {
+    let make = |error: &git2::Error| GitError::new("blame", error);
+    let path_ref = Path::new(path);
+
+    let blame = repo.blame_file(path_ref, None).map_err(|e| make(&e))?;
+
+    // Read the file's text from the HEAD tree (not the working dir) so its lines
+    // match the blame's final line numbering.
+    let head = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| make(&e))?;
+    let blob = head
+        .tree()
+        .and_then(|t| t.get_path(path_ref).and_then(|e| e.to_object(repo)))
+        .and_then(|o| o.peel_to_blob())
+        .map_err(|e| make(&e))?;
+    let content = std::str::from_utf8(blob.content())
+        .map_err(|_| GitError::custom("blame", "cannot blame a binary file"))?;
+
+    let lines = content
+        .lines()
+        .enumerate()
+        .map(|(i, text)| {
+            // get_line is 1-based; fall back to empty attribution if absent.
+            let hunk = blame.get_line(i + 1);
+            let (short_sha, author, time) = match hunk {
+                Some(hunk) => {
+                    let oid = hunk.final_commit_id();
+                    let short_sha = oid.to_string()[..7].to_string();
+                    let sig = hunk.final_signature();
+                    let author = sig
+                        .as_ref()
+                        .and_then(|s| s.name().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let time = sig.as_ref().map(|s| s.when().seconds()).unwrap_or(0);
+                    (short_sha, author, time)
+                }
+                None => (String::new(), String::new(), 0),
+            };
+            BlameLine {
+                short_sha,
+                author,
+                time,
+                content: text.to_string(),
+            }
+        })
+        .collect();
+
+    Ok(BlameFile {
+        path: path.to_string(),
+        lines,
     })
 }
 
@@ -3472,6 +3535,55 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), content);
         assert_eq!(paths(&events.last_conflicted()), ["a.txt"]);
         assert_eq!(last_conflict(&events).raw, content);
+    }
+
+    /// The most recent `BlameLoaded` payload.
+    fn last_blame(events: &Collector) -> BlameFile {
+        events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::BlameLoaded(file) => Some(file),
+                _ => None,
+            })
+            .expect("expected a BlameLoaded event")
+    }
+
+    #[test]
+    fn blame_attributes_each_line_to_its_commit() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "f.txt", "one\ntwo\n");
+        // A later commit appends a third line, leaving the first two untouched.
+        commit_file(dir.path(), &repo, &events, "f.txt", "one\ntwo\nthree\n");
+
+        process(&repo, GitCommand::LoadBlame("f.txt".into()), &events);
+        let blame = last_blame(&events);
+
+        assert_eq!(blame.lines.len(), 3);
+        assert_eq!(blame.lines[0].content, "one");
+        assert_eq!(blame.lines[2].content, "three");
+        // The appended line is attributed to a different (later) commit.
+        assert_ne!(blame.lines[0].short_sha, blame.lines[2].short_sha);
+        assert!(blame.lines.iter().all(|l| l.author == "Tester"));
+        assert!(blame.lines.iter().all(|l| l.time > 0));
+    }
+
+    #[test]
+    fn blaming_a_missing_file_reports_an_error() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "f.txt", "x\n");
+
+        process(&repo, GitCommand::LoadBlame("nope.txt".into()), &events);
+
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::Error(_)))
+        );
     }
 }
 

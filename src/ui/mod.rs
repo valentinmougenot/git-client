@@ -22,8 +22,8 @@ use crate::app::{
     Selection, UiMessage, ViewMode,
 };
 use crate::git::{
-    BranchInfo, ChangeKind, CommitInfo, ConflictFile, ConflictSegment, ConflictSide, Diff, DiffLine,
-    DiffLineKind, FileEntry, HeadInfo, ResetKind, StashInfo, TagInfo,
+    BlameFile, BranchInfo, ChangeKind, CommitInfo, ConflictFile, ConflictSegment, ConflictSide,
+    Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo, ResetKind, StashInfo, TagInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -48,15 +48,20 @@ pub fn root(app: &App) -> Element<'_, Message> {
 
     let right: Element<Message> = match app.view {
         ViewMode::Changes => {
-            // A conflicted file under manual edit shows the editor; otherwise the
-            // region-by-region resolver; any other selection shows its diff.
+            // A conflicted file under manual edit shows the editor; else the
+            // region-by-region resolver; else Blame if toggled on; otherwise the
+            // diff.
             let selected_path = app.repo.selected.as_ref().map(|s| s.path.as_str());
-            let top: Element<Message> = match (&app.repo.editing, &app.repo.conflict) {
-                (Some(edit), _) if selected_path == Some(edit.path.as_str()) => {
+            let top: Element<Message> = match (&app.repo.editing, &app.repo.conflict, &app.repo.blame)
+            {
+                (Some(edit), _, _) if selected_path == Some(edit.path.as_str()) => {
                     conflict_editor_view(edit)
                 }
-                (_, Some(file)) if selected_path == Some(file.path.as_str()) => {
+                (_, Some(file), _) if selected_path == Some(file.path.as_str()) => {
                     conflict_view(file)
+                }
+                (_, _, Some(file)) if selected_path == Some(file.path.as_str()) => {
+                    blame_view(file)
                 }
                 _ => diff_view(&app.repo),
             };
@@ -1705,6 +1710,25 @@ fn relative_time(unix_secs: i64) -> String {
     }
 }
 
+/// Format a Unix timestamp (seconds, UTC) as `YYYY-MM-DD`. Blame dates are often
+/// old, where an absolute date reads better than a coarse "2y ago". Uses the
+/// civil-from-days algorithm so it needs no date library.
+fn ymd(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    // Howard Hinnant's days-to-civil: shift the epoch so the year starts in March.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 // ── Diff View ────────────────────────────────────────────────────────────
 
 /// The right panel: the Diff of the selected file, GitHub-style.
@@ -1751,6 +1775,80 @@ fn diff_view(repo: &RepoState) -> Element<'_, Message> {
         .width(Fill);
 
     column![diff_header(diff), body].spacing(10).into()
+}
+
+// ── Blame View ───────────────────────────────────────────────────────────
+
+/// The right panel in Blame mode: every line of the file tagged with the Commit
+/// that last touched it (short SHA, author, date), with a "Diff" escape back.
+fn blame_view(file: &BlameFile) -> Element<'_, Message> {
+    let header = container(
+        row![
+            text("Blame").size(11).color(style::INFO),
+            text(file.path.clone())
+                .size(13)
+                .font(Font::MONOSPACE)
+                .color(style::TEXT),
+            space::horizontal(),
+            button(text("Diff").size(11))
+                .on_press(Message::Ui(UiMessage::HideBlame))
+                .padding([3, 9])
+                .style(style::ghost),
+        ]
+        .spacing(12)
+        .align_y(Center),
+    )
+    .style(style::diff_header)
+    .padding([7, 12])
+    .width(Fill);
+
+    let lang = highlight::lang_for(&file.path);
+    let rows: Vec<Element<Message>> = file
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| blame_line(i + 1, line, lang))
+        .collect();
+    let body = scrollable(column(rows).padding([8, 4]))
+        .height(Fill)
+        .width(Fill);
+
+    column![header, body].spacing(10).into()
+}
+
+/// One blamed line: a gutter (short SHA, author, date, line number) then the
+/// syntax-highlighted content. Lines sharing a Commit with the line above hide
+/// the repeated attribution, so blocks from one Commit read as a group.
+fn blame_line<'a>(
+    lineno: usize,
+    line: &'a crate::git::BlameLine,
+    lang: highlight::Lang,
+) -> Element<'a, Message> {
+    let attribution = format!("{:7} {:>10.10} {}", line.short_sha, line.author, ymd(line.time));
+
+    let mut spans: Vec<iced::widget::text::Span<()>> = Vec::new();
+    for (fragment, color) in highlight::spans(&line.content, lang) {
+        spans.push(span(fragment.to_string()).color(color));
+    }
+
+    container(
+        row![
+            text(attribution)
+                .font(Font::MONOSPACE)
+                .size(11)
+                .color(style::TEXT_FAINT),
+            text(format!("{lineno:>4}"))
+                .font(Font::MONOSPACE)
+                .size(12)
+                .color(style::TEXT_FAINT),
+            rich_text(spans).font(Font::MONOSPACE).size(13),
+        ]
+        .spacing(12)
+        .align_y(Center),
+    )
+    .width(Fill)
+    .padding([1, 10])
+    .into()
 }
 
 /// A hunk header line, carrying the `@@ … @@` text and a per-hunk action:
@@ -1833,6 +1931,10 @@ fn diff_header(diff: &Diff) -> Element<'_, Message> {
             space::horizontal(),
             text(format!("+{added}")).size(12).color(style::GREEN),
             text(format!("−{removed}")).size(12).color(style::RED),
+            button(text("Blame").size(11))
+                .on_press(Message::Ui(UiMessage::ShowBlame))
+                .padding([3, 9])
+                .style(style::ghost),
         ]
         .spacing(12)
         .align_y(Center),

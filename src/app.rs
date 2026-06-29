@@ -14,9 +14,9 @@ use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Point, Subscription, Task};
 
 use crate::git::{
-    self, BranchInfo, CherryPickOutcome, CommitDetail, CommitInfo, ConflictFile, ConflictSide, Diff,
-    FileEntry, GitCommand, GitEvent, HeadInfo, MergeOutcome, ResetKind, RevertOutcome, StashDiff,
-    StashInfo, TagInfo,
+    self, BlameFile, BranchInfo, CherryPickOutcome, CommitDetail, CommitInfo, ConflictFile,
+    ConflictSide, Diff, FileEntry, GitCommand, GitEvent, HeadInfo, MergeOutcome, ResetKind,
+    RevertOutcome, StashDiff, StashInfo, TagInfo,
 };
 use crate::ui;
 
@@ -167,6 +167,9 @@ pub struct RepoState {
     /// has opened the editor. The fallback when ours/theirs/both can't express the
     /// merge; cleared when saved, cancelled, or the selection changes.
     pub editing: Option<ConflictEdit>,
+    /// The line-by-line blame of the selected file, when the user has switched the
+    /// right panel to Blame. Cleared on returning to the diff or changing files.
+    pub blame: Option<BlameFile>,
 }
 
 /// A conflicted file open in the manual editor: which file, and its live buffer.
@@ -304,6 +307,10 @@ pub enum UiMessage {
     ConflictEdited(iced::widget::text_editor::Action),
     /// Close the manual conflict editor without saving.
     CancelConflictEdit,
+    /// Switch the right panel to the line-by-line Blame of the selected file.
+    ShowBlame,
+    /// Return from Blame to the file's Diff.
+    HideBlame,
 }
 
 #[derive(Debug, Clone)]
@@ -483,6 +490,13 @@ impl App {
                 }
             }
             UiMessage::CancelConflictEdit => self.repo.editing = None,
+            UiMessage::ShowBlame => {
+                if let Some(selection) = &self.repo.selected {
+                    self.repo.blame = None;
+                    self.dispatch(GitCommand::LoadBlame(selection.path.clone()));
+                }
+            }
+            UiMessage::HideBlame => self.repo.blame = None,
         }
     }
 
@@ -812,6 +826,17 @@ impl App {
                     self.repo.conflict = Some(file);
                 }
             }
+            GitEvent::BlameLoaded(file) => {
+                // Keep it only if it still matches the selected file.
+                let matches = self
+                    .repo
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| s.path == file.path);
+                if matches {
+                    self.repo.blame = Some(file);
+                }
+            }
             GitEvent::HistoryLoaded(commits) => {
                 self.history.commits = commits;
                 self.reconcile_commit_selection();
@@ -982,6 +1007,11 @@ impl App {
         if self.repo.editing.as_ref().is_some_and(|e| e.path != path) {
             self.repo.editing = None;
         }
+        // Selecting a file returns to its diff; a stale blame would be the wrong
+        // file's, so drop it (the user re-opens Blame if they want it).
+        if self.repo.blame.as_ref().is_some_and(|b| b.path != path) {
+            self.repo.blame = None;
+        }
         self.repo.selected = Some(Selection {
             path: path.clone(),
             staged,
@@ -1101,6 +1131,7 @@ impl App {
         if self.repo.selected.is_some() && !still_present {
             self.repo.selected = None;
             self.repo.diff = None;
+            self.repo.blame = None;
         }
 
         // The conflict view only applies while the selected file is still
@@ -1751,6 +1782,72 @@ mod tests {
         // Saving closes the editor (the worker takes over from here).
         update(&mut app, Message::Git(GitMessage::SaveConflictEdit));
         assert!(app.repo.editing.is_none());
+    }
+
+    #[test]
+    fn blame_is_kept_when_it_matches_the_selection_then_hidden() {
+        let mut app = App::new();
+        app.repo.selected = Some(Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        });
+
+        let blame = crate::git::BlameFile {
+            path: "a.txt".to_string(),
+            lines: vec![crate::git::BlameLine {
+                short_sha: "abc1234".to_string(),
+                author: "Tester".to_string(),
+                time: 1_700_000_000,
+                content: "x".to_string(),
+            }],
+        };
+
+        // Blame for the selected file is stored…
+        update(&mut app, Message::GitEvent(GitEvent::BlameLoaded(blame)));
+        assert!(app.repo.blame.is_some());
+
+        // …and the Diff toggle clears it.
+        update(&mut app, Message::Ui(UiMessage::HideBlame));
+        assert!(app.repo.blame.is_none());
+    }
+
+    #[test]
+    fn blame_for_another_file_is_ignored() {
+        let mut app = App::new();
+        app.repo.selected = Some(Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        });
+
+        let blame = crate::git::BlameFile {
+            path: "other.txt".to_string(),
+            lines: vec![],
+        };
+        update(&mut app, Message::GitEvent(GitEvent::BlameLoaded(blame)));
+        assert!(app.repo.blame.is_none());
+    }
+
+    #[test]
+    fn selecting_another_file_drops_a_stale_blame() {
+        let mut app = App::new();
+        app.repo.unstaged = vec![entry("b.txt", ChangeKind::Modified)];
+        app.repo.selected = Some(Selection {
+            path: "a.txt".to_string(),
+            staged: false,
+        });
+        app.repo.blame = Some(crate::git::BlameFile {
+            path: "a.txt".to_string(),
+            lines: vec![],
+        });
+
+        update(
+            &mut app,
+            Message::Ui(UiMessage::FileSelected {
+                path: "b.txt".to_string(),
+                staged: false,
+            }),
+        );
+        assert!(app.repo.blame.is_none());
     }
 
     #[test]
