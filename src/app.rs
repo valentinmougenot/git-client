@@ -14,9 +14,9 @@ use iced::keyboard::{Event as KeyEvent, Key};
 use iced::{Point, Subscription, Task};
 
 use crate::git::{
-    self, BlameFile, BranchInfo, CherryPickOutcome, CommitDetail, CommitInfo, ConflictFile,
-    ConflictSide, Diff, FileEntry, GitCommand, GitEvent, HeadInfo, MergeOutcome, ResetKind,
-    RevertOutcome, StashDiff, StashInfo, TagInfo,
+    self, BlameFile, BranchInfo, CherryPickOutcome, CommitDetail, CommitInfo, Comparison,
+    ConflictFile, ConflictSide, Diff, FileEntry, GitCommand, GitEvent, HeadInfo, MergeOutcome,
+    ResetKind, RevertOutcome, StashDiff, StashInfo, TagInfo,
 };
 use crate::ui;
 
@@ -124,6 +124,9 @@ pub struct BranchesState {
     pub new_name: String,
     /// Whether Prune is armed, awaiting a confirming second press.
     pub prune_armed: bool,
+    /// The loaded diff between two refs, shown in the detail panel; cleared by
+    /// Close. Set by "Compare with current" on a branch.
+    pub comparison: Option<Comparison>,
 }
 
 /// The Stashes view's state: the loaded stashes, the in-progress stash message,
@@ -314,6 +317,8 @@ pub enum UiMessage {
     /// Jump to a Commit in the History view (e.g. from a Blame line), loading its
     /// detail even when it sits outside the loaded history window.
     ShowCommit(String),
+    /// Close the branch comparison, returning the detail panel to its summary.
+    CloseComparison,
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +353,8 @@ pub enum GitMessage {
     DeleteBranch(String),
     /// Merge the named branch into the current branch.
     Merge(String),
+    /// Compare the named branch against the current branch (diff current → branch).
+    CompareWithCurrent(String),
     /// Resolve a whole conflicted file by taking one side (ours/theirs/both).
     ResolveConflict { path: String, side: ConflictSide },
     /// Resolve one conflict region of a file by taking one side.
@@ -501,6 +508,7 @@ impl App {
             }
             UiMessage::HideBlame => self.repo.blame = None,
             UiMessage::ShowCommit(sha) => self.navigate_to_commit(sha),
+            UiMessage::CloseComparison => self.branches.comparison = None,
         }
     }
 
@@ -656,6 +664,18 @@ impl App {
             GitMessage::CommitAndPush => self.start_commit(true),
             GitMessage::Checkout(name) => self.dispatch(GitCommand::Checkout(name)),
             GitMessage::Merge(name) => self.dispatch(GitCommand::Merge(name)),
+            GitMessage::CompareWithCurrent(name) => {
+                // Base is the current branch (or HEAD when detached); the diff
+                // shows what the picked branch has over it.
+                let base = self
+                    .repo
+                    .head
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "HEAD".to_string());
+                self.branches.comparison = None;
+                self.dispatch(GitCommand::CompareRefs { base, target: name });
+            }
             GitMessage::ResolveConflict { path, side } => {
                 self.dispatch(GitCommand::ResolveConflict { path, side })
             }
@@ -855,6 +875,9 @@ impl App {
                 if matches {
                     self.repo.blame = Some(file);
                 }
+            }
+            GitEvent::ComparisonLoaded(comparison) => {
+                self.branches.comparison = Some(comparison);
             }
             GitEvent::HistoryLoaded(commits) => {
                 self.history.commits = commits;
@@ -1892,6 +1915,26 @@ mod tests {
             message: "message".to_string(),
             lines: vec![],
         }
+    }
+
+    #[test]
+    fn a_comparison_loads_into_the_branches_panel_and_closes() {
+        let mut app = App::new();
+
+        let comparison = Comparison {
+            base: "main".to_string(),
+            target: "feature".to_string(),
+            lines: vec![],
+        };
+        update(
+            &mut app,
+            Message::GitEvent(GitEvent::ComparisonLoaded(comparison)),
+        );
+        assert!(app.branches.comparison.is_some());
+
+        // Close returns the panel to its summary.
+        update(&mut app, Message::Ui(UiMessage::CloseComparison));
+        assert!(app.branches.comparison.is_none());
     }
 
     #[test]

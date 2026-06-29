@@ -138,6 +138,10 @@ pub fn process(repo: &Repository, command: GitCommand, events: &impl EventSink) 
             Ok(file) => events.emit(GitEvent::BlameLoaded(file)),
             Err(error) => events.emit(GitEvent::Error(error)),
         },
+        GitCommand::CompareRefs { base, target } => match compare_refs(repo, &base, &target) {
+            Ok(comparison) => events.emit(GitEvent::ComparisonLoaded(comparison)),
+            Err(error) => events.emit(GitEvent::Error(error)),
+        },
         GitCommand::Reset { sha, kind } => {
             match reset_to(repo, &sha, kind) {
                 Ok(short) => events.emit(GitEvent::ResetDone(short)),
@@ -890,6 +894,31 @@ fn load_commit_detail(repo: &Repository, sha: &str) -> Result<CommitDetail, git2
         email: author.email().unwrap_or_default().to_string(),
         time: commit.time().seconds(),
         message: commit.message().unwrap_or_default().to_string(),
+        lines,
+    })
+}
+
+/// Compare two refs: the diff from `base` to `target` (what `target` adds over
+/// `base`). Each ref is resolved through revparse, so branch names, remote
+/// branches (`origin/x`), tags, and SHAs all work.
+fn compare_refs(repo: &Repository, base: &str, target: &str) -> Result<Comparison, GitError> {
+    let tree_for = |name: &str| {
+        repo.revparse_single(name)
+            .and_then(|obj| obj.peel_to_commit())
+            .and_then(|commit| commit.tree())
+            .map_err(|error| GitError::new(format!("compare: resolve {name}"), &error))
+    };
+    let base_tree = tree_for(base)?;
+    let target_tree = tree_for(target)?;
+
+    let diff = repo
+        .diff_tree_to_tree(Some(&base_tree), Some(&target_tree), None)
+        .map_err(|error| GitError::new("compare", &error))?;
+    let lines = diff_to_lines(&diff).map_err(|error| GitError::new("compare", &error))?;
+
+    Ok(Comparison {
+        base: base.to_string(),
+        target: target.to_string(),
         lines,
     })
 }
@@ -3568,6 +3597,89 @@ mod tests {
         assert_eq!(blame.lines[0].sha.len(), 40);
         assert!(blame.lines.iter().all(|l| l.author == "Tester"));
         assert!(blame.lines.iter().all(|l| l.time > 0));
+    }
+
+    /// The most recent `ComparisonLoaded` payload.
+    fn last_comparison(events: &Collector) -> Comparison {
+        events
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                GitEvent::ComparisonLoaded(c) => Some(c),
+                _ => None,
+            })
+            .expect("expected a ComparisonLoaded event")
+    }
+
+    #[test]
+    fn compare_refs_shows_what_the_target_adds_over_the_base() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "base\n");
+        // A branch with an extra file, then back to master to compare from there.
+        process(&repo, GitCommand::CreateBranch("feature".into()), &events);
+        commit_file(dir.path(), &repo, &events, "b.txt", "added on feature\n");
+        process(&repo, GitCommand::Checkout("master".into()), &events);
+
+        process(
+            &repo,
+            GitCommand::CompareRefs {
+                base: "master".into(),
+                target: "feature".into(),
+            },
+            &events,
+        );
+
+        let c = last_comparison(&events);
+        assert_eq!(c.base, "master");
+        assert_eq!(c.target, "feature");
+        // The file added on feature appears as a header plus an addition.
+        assert!(c.lines.iter().any(|l| l.content.contains("b.txt")));
+        assert!(c.lines.iter().any(|l| {
+            matches!(l.kind, DiffLineKind::Addition) && l.content.contains("added on feature")
+        }));
+    }
+
+    #[test]
+    fn comparing_a_ref_with_itself_yields_no_lines() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+
+        process(
+            &repo,
+            GitCommand::CompareRefs {
+                base: "master".into(),
+                target: "master".into(),
+            },
+            &events,
+        );
+
+        assert!(last_comparison(&events).lines.is_empty());
+    }
+
+    #[test]
+    fn comparing_an_unknown_ref_reports_an_error() {
+        let (dir, repo) = temp_repo();
+        let events = Collector::default();
+        commit_file(dir.path(), &repo, &events, "a.txt", "x\n");
+
+        process(
+            &repo,
+            GitCommand::CompareRefs {
+                base: "master".into(),
+                target: "ghost".into(),
+            },
+            &events,
+        );
+
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|e| matches!(e, GitEvent::Error(_)))
+        );
     }
 
     #[test]

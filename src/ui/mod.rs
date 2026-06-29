@@ -22,8 +22,8 @@ use crate::app::{
     Selection, UiMessage, ViewMode,
 };
 use crate::git::{
-    BlameFile, BranchInfo, ChangeKind, CommitInfo, ConflictFile, ConflictSegment, ConflictSide,
-    Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo, ResetKind, StashInfo, TagInfo,
+    BlameFile, BranchInfo, ChangeKind, CommitInfo, Comparison, ConflictFile, ConflictSegment,
+    ConflictSide, Diff, DiffLine, DiffLineKind, FileEntry, HeadInfo, ResetKind, StashInfo, TagInfo,
 };
 
 /// The application's custom dark [`iced::Theme`].
@@ -81,11 +81,17 @@ pub fn root(app: &App) -> Element<'_, Message> {
             .width(Length::FillPortion(3))
             .height(Fill)
             .into(),
-        ViewMode::Branches => container(branches_detail(app))
-            .style(style::panel)
-            .width(Length::FillPortion(3))
-            .height(Fill)
-            .into(),
+        ViewMode::Branches => {
+            let detail: Element<Message> = match &app.branches.comparison {
+                Some(comparison) => comparison_view(comparison),
+                None => branches_detail(app),
+            };
+            container(detail)
+                .style(style::panel)
+                .width(Length::FillPortion(3))
+                .height(Fill)
+                .into()
+        }
         ViewMode::Stashes => container(stashes_detail(app))
             .style(style::panel)
             .width(Length::FillPortion(3))
@@ -218,6 +224,10 @@ fn menu_panel<'a>(app: &'a App, menu: &'a ContextMenu) -> Element<'a, Message> {
             items.push(menu_item(
                 "Merge into current",
                 Message::Git(GitMessage::Merge(name.clone())),
+            ));
+            items.push(menu_item(
+                "Compare with current",
+                Message::Git(GitMessage::CompareWithCurrent(name.clone())),
             ));
             if !is_remote {
                 items.push(menu_item_danger(
@@ -1402,6 +1412,62 @@ fn branches_detail(app: &App) -> Element<'_, Message> {
     container(lines.align_x(Center))
         .center(Fill)
         .padding(12)
+        .into()
+}
+
+/// The branch comparison: a header naming both refs (with add/remove counts and a
+/// Close button) over the combined diff `base → target`.
+fn comparison_view(comparison: &Comparison) -> Element<'_, Message> {
+    let added = comparison
+        .lines
+        .iter()
+        .filter(|l| matches!(l.kind, DiffLineKind::Addition))
+        .count();
+    let removed = comparison
+        .lines
+        .iter()
+        .filter(|l| matches!(l.kind, DiffLineKind::Deletion))
+        .count();
+
+    let header = container(
+        row![
+            text(comparison.base.clone())
+                .size(13)
+                .font(Font::MONOSPACE)
+                .color(style::YELLOW),
+            text("→").size(13).color(style::TEXT_FAINT),
+            text(comparison.target.clone())
+                .size(13)
+                .font(Font::MONOSPACE)
+                .color(style::GREEN),
+            space::horizontal(),
+            text(format!("+{added}")).size(12).color(style::GREEN),
+            text(format!("−{removed}")).size(12).color(style::RED),
+            button(text("Close").size(11))
+                .on_press(Message::Ui(UiMessage::CloseComparison))
+                .padding([3, 9])
+                .style(style::ghost),
+        ]
+        .spacing(10)
+        .align_y(Center),
+    )
+    .style(style::diff_header)
+    .padding([7, 12])
+    .width(Fill);
+
+    if comparison.lines.is_empty() {
+        let empty = container(
+            text("No differences between these refs")
+                .size(14)
+                .color(style::TEXT_FAINT),
+        )
+        .center(Fill);
+        return column![header, empty].spacing(10).into();
+    }
+
+    column![header, diff_body(&comparison.lines)]
+        .spacing(10)
+        .padding([12, 0])
         .into()
 }
 

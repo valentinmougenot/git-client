@@ -44,6 +44,9 @@ pub enum GitCommand {
     LoadCommitDetail(String),
     /// Load the line-by-line blame for a file (its committed HEAD version).
     LoadBlame(String),
+    /// Compare two refs (branches, tags, or SHAs): the diff from `base` to
+    /// `target`, i.e. what `target` has that `base` does not.
+    CompareRefs { base: String, target: String },
     /// Move the current branch to the given Commit, with the chosen reset mode
     /// (soft keeps the index and Working Tree; mixed resets the index; hard
     /// resets both, discarding uncommitted changes).
@@ -188,8 +191,20 @@ pub enum GitEvent {
     ConflictLoaded(ConflictFile),
     /// A file's line-by-line blame.
     BlameLoaded(BlameFile),
+    /// The diff between two refs.
+    ComparisonLoaded(Comparison),
     /// Any operation failed.
     Error(GitError),
+}
+
+/// The diff from `base` to `target` (what `target` has that `base` does not),
+/// rendered as a multi-file patch for the Diff View.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comparison {
+    pub base: String,
+    pub target: String,
+    /// The combined diff, with an injected `● path` header before each file.
+    pub lines: Vec<DiffLine>,
 }
 
 /// A file blamed line by line: each line tagged with the Commit that last touched
